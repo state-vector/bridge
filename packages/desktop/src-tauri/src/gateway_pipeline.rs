@@ -958,6 +958,10 @@ fn recover(shared: &Config, skip: Vec<Ticket>) -> Result<Vec<Recovered>, String>
 pub(super) struct Controller { registry: Registry, admission: Admission, shared: Config, recovery: Recovery, last_snapshot: Instant,
     capacity_probe: Option<lifecycle::Job<Result<serde_json::Value, String>>>, next_capacity_probe: Instant,
     workspace_job: Option<lifecycle::Job<Result<workspace::Status, String>>>, next_workspace: Instant,
+    /// BR#23269 — a forced pass (test hook) stays due even while a pass is in
+    /// flight: the completion handler must not push the schedule out over it,
+    /// or the force degenerates into one full INTERVAL of added latency.
+    workspace_forced: bool,
     /// BR#19525 — bounded admission sampling, decoupled from the slow reclaim pass.
     admission_job: Option<lifecycle::Job<Result<workspace::Status, String>>>, next_admission: Instant,
     disk_admission: workspace::Admission, disk_observed: Instant,
@@ -966,7 +970,7 @@ pub(super) struct Controller { registry: Registry, admission: Admission, shared:
     reported_attention:std::collections::HashSet<(String,String)> }
 impl Controller {
     #[cfg(test)]
-    pub(crate) fn force_workspace_pass(&mut self) { self.next_workspace = Instant::now(); }
+    pub(crate) fn force_workspace_pass(&mut self) { self.next_workspace = Instant::now(); self.workspace_forced = true; }
     #[cfg(test)]
     pub(crate) fn held_for_test(&self) -> usize { self.registry.counts().held }
     pub fn new(cfg: &DispatchConfig, readiness: &GatewayReadiness, snap: &SharedSnapshot) -> Self {
@@ -987,7 +991,7 @@ impl Controller {
             Ok(None) => Admission::Idle { until: Instant::now() },
             Err(reason) => Admission::Held { reason },
         };
-        Self { registry, admission, shared, recovery: Recovery::Initial, last_snapshot: Instant::now(), capacity_probe: None, next_capacity_probe: Instant::now(), workspace_job: None, next_workspace: Instant::now(), admission_job: None, next_admission: Instant::now(), disk_admission: workspace::Admission::Held { reason: "workspace inventory not yet reconciled".into() }, disk_observed:Instant::now(), last_wedge_alarm_at: None, reported_attention:Default::default() }
+        Self { registry, admission, shared, recovery: Recovery::Initial, last_snapshot: Instant::now(), capacity_probe: None, next_capacity_probe: Instant::now(), workspace_job: None, next_workspace: Instant::now(), workspace_forced: false, admission_job: None, next_admission: Instant::now(), disk_admission: workspace::Admission::Held { reason: "workspace inventory not yet reconciled".into() }, disk_observed:Instant::now(), last_wedge_alarm_at: None, reported_attention:Default::default() }
     }
     pub fn idle(&self) -> bool { self.registry.is_idle() && self.capacity_probe.is_none() && self.workspace_job.is_none() && self.admission_job.is_none() && matches!(self.admission, Admission::Idle { .. }) && matches!(self.recovery, Recovery::Ready { .. }) }
     pub fn active(&self) -> usize { usize::from(!self.idle()) }
@@ -1084,12 +1088,19 @@ impl Controller {
                         dlog("workspace", &format!("reconciliation incomplete; retained for retry: {error}"));
                     },
                 }
-                self.workspace_job = None; self.next_workspace = Instant::now() + workspace::INTERVAL;
+                // BR#23269 — a forced pass survives the in-flight job: keep the
+                // (already due) forced schedule instead of pushing it out a
+                // full INTERVAL. The flag is consumed at pass start, so only
+                // the forced-for pass skips the throttle. Production never
+                // sets the flag: the 30s cadence is unchanged there.
+                self.workspace_job = None;
+                if !self.workspace_forced { self.next_workspace = Instant::now() + workspace::INTERVAL; }
             }
         }
         // Disk ownership is per workspace, not a global idle barrier. Held
         // jobs/update drain cannot starve reclamation of unrelated allocations.
         if self.next_workspace <= Instant::now() && self.workspace_job.is_none() {
+            self.workspace_forced = false;
             let cfg = cfg.clone();
             let protected = self.registry.tickets();
             self.workspace_job = Some(lifecycle::Job::start(move || workspace::Owner::open(&cfg)?.reconcile(&protected)));
