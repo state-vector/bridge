@@ -71,6 +71,31 @@ describe("durable execution failure boundaries", () => {
       expect(recoverResourceStartBarrier(barrier, 200)).toBe(barrier);
     }
   });
+  it("recovers the stale-git-lockfile identity gate as a bounded resource cooldown, never a permanent prerequisite", () => {
+    // BR#6992 root-fix #2 live specimen: one killed writer orphaned
+    // <clone>/.git/config.lock and every startup of every task of that repo
+    // replayed the same refusal — restart- and upgrade-proof, because a
+    // repair_required barrier only exits through a begin that readiness
+    // itself refuses. The resource heals (runner self-heal db4bda6e4, or a
+    // concurrent writer finishing) and the retry changes neither credential
+    // nor configuration, so the OS error shape is the evidence.
+    const reason = "gate: identity profile failed: git config user.email failed: error: could not lock config file /srv/work/repos/state-vector-superpositional-3f2a/.git/config: File exists";
+    const legacy = { kind: "repair_required", fingerprint: "same-worker/config", failures: 5, reason } as const;
+    const recovered = recoverResourceStartBarrier(legacy, 100);
+    expect(recovered).toMatchObject({ kind: "cooldown", fingerprint: legacy.fingerprint, failures: 1, until_ts: 60_100 });
+    expect(recoverResourceStartBarrier(recovered, 50_000)).toBe(recovered);
+    let repeated = recovered;
+    for (let i = 1; i <= 5; i++) repeated = nextExecutorStartBarrier(repeated, legacy.fingerprint, reason, i * 70_000, "prerequisite");
+    expect(repeated).toMatchObject({ kind: "cooldown", failures: 1 });
+    // The closed list must not widen into arbitrary prose matching: a
+    // missing key, a failed signature, an unknown identity-gate cause, and
+    // either half of the error shape alone all stay prerequisites.
+    for (const failure of ["gate: signing key not found", "gate: sign check failed (exit 255)", "gate: identity profile failed: git config user.email failed: error: unknown", "could not lock config file", "File exists while signing the receipt"]) {
+      const barrier = nextExecutorStartBarrier(null, legacy.fingerprint, failure, 100, "prerequisite");
+      expect(barrier.kind).toBe("repair_required");
+      expect(recoverResourceStartBarrier(barrier, 200)).toBe(barrier);
+    }
+  });
   it("bounds unstarted failures across restarts; only changed prerequisites reset their budget", () => {
     const one = nextExecutorStartBarrier(null, "worker/config-one", "begin refused", 100);
     expect(one).toMatchObject({ kind: "cooldown", failures: 1, until_ts: 60_100 });

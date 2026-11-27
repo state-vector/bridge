@@ -1581,7 +1581,13 @@ shared checkout keeps its own identity.
   60 seconds — git holds config locks for milliseconds, so an older one can
   only be debris from a killed writer — logging `removed stale git lockfile
   <path> (age Ns)`. A fresh lock is treated as a live concurrent writer and
-  keeps the normal refusal.
+  keeps the normal refusal. The barrier/recovery loop is closed on both
+  planes: the runner reports a lock refusal as a **resource** failure (the
+  hub stamps a 60s cooldown, never `repair_required`), and the hub recovers
+  an existing `repair_required` barrier whose reason carries the lock-error
+  shape on its next readiness pass — identity-gated resource failures that
+  change neither credential nor configuration always recover through a
+  bounded cooldown, never a new identity fingerprint.
 - **Board surfacing**: Connect nests each gateway's provisioned worker
   agents under it with their identity class, and the pairing screen states
   the class the device declared plus what its runner's dispatches commit

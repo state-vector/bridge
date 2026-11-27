@@ -26,9 +26,12 @@ export const ExecutorStartBarrierSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("repair_required"), fingerprint: text, failures: z.number().int().positive(), reason: text }),
 ]);
 export type ExecutorStartBarrier = z.infer<typeof ExecutorStartBarrierSchema>;
-/** Compatibility boundary for old runners that wrapped ENOSPC in an identity
- * gate. Only the scratch-directory OS error is recoverable this way; missing
- * keys, failed signatures and arbitrary gate failures remain prerequisites. */
+/** Compatibility boundary for old runners that wrapped resource failures in
+ * an identity gate. Identity-gated resource failures that change neither
+ * credential nor configuration recover through a bounded cooldown: the
+ * scratch-directory ENOSPC, profile-provisioning ENOSPC, and the orphaned
+ * config.lock refusal. Missing keys, failed signatures and arbitrary gate
+ * failures remain prerequisites. */
 export function isSigningScratchResourceFailure(reason: string): boolean {
   return reason.includes("sign-check scratch dir: No space left on device (os error 28)");
 }
@@ -40,12 +43,23 @@ export function isSigningScratchResourceFailure(reason: string): boolean {
 export function isIdentityProfileResourceFailure(reason: string): boolean {
   return reason.includes("gate: identity profile failed:") && reason.includes("No space left on device");
 }
+/** BR#6992 root-fix #2 — the stale-git-lockfile class: one killed writer
+ * orphaning `<common-dir>/config.lock` on a shared clone refuses every
+ * repo-scope `git config` of every worktree ("could not lock config file
+ * …: File exists"), restart- and upgrade-proof. The resource heals (the
+ * runner self-heals stale locks; a live writer holds its lock for
+ * milliseconds), and the retry changes neither credential nor
+ * configuration — so the OS error shape, surviving any wrapping, is the
+ * evidence. Half the shape alone is not the shape. */
+export function isStaleGitLockIdentityFailure(reason: string): boolean {
+  return reason.includes("could not lock config file") && reason.includes("File exists");
+}
 /** The full evidence-bearing set a start barrier may recover from without a
- * changed credential or configuration: transport/scratch resource failures
- * and begin retries. Consumers that must NOT treat a failure as a task
- * prerequisite use this predicate. */
+ * changed credential or configuration: transport/scratch resource failures,
+ * begin retries, and identity-gated resource refusals. Consumers that must
+ * NOT treat a failure as a task prerequisite use this predicate. */
 export function isResourceRecoverableStartFailure(reason: string): boolean {
-  return isSigningScratchResourceFailure(reason) || isBeginReadinessRetry(reason) || isIdentityProfileResourceFailure(reason);
+  return isSigningScratchResourceFailure(reason) || isBeginReadinessRetry(reason) || isIdentityProfileResourceFailure(reason) || isStaleGitLockIdentityFailure(reason);
 }
 export function isBeginReadinessRetry(reason: string): boolean {
   // Older hubs used this same rejection for a temporary readiness hold and

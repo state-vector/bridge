@@ -607,6 +607,19 @@ fn probe_retained_work(path: Option<&Path>) -> bool {
     }).unwrap_or(false)
 }
 
+/// A config.lock EEXIST refusal (BR#6992 root-fix #2) is a resource failure,
+/// never a prerequisite: the lock heals — stale ones are self-healed before
+/// the git config loop even runs, and a fresh one belongs to a concurrent
+/// writer that finishes in milliseconds — and the retry changes neither
+/// credential nor configuration. Reporting it as "resource" makes the hub
+/// back off on a bounded cooldown instead of demanding a new identity
+/// fingerprint (a repair_required barrier only exits through a begin that
+/// readiness itself refuses — a closed loop). Same closed substring shape
+/// the hub recovers from; half the shape is not the shape.
+fn config_lock_refusal(reason: &str) -> bool {
+    reason.contains("could not lock config file") && reason.contains("File exists")
+}
+
 fn failed_start(cfg: &DispatchConfig, tid: &str, stage: StartStage, reason: &str, expected_attempt: Option<&str>, path: Option<&Path>) {
     let result = (|| -> Result<serde_json::Value, String> {
         let state = execution_call(cfg, tid, json!({ "kind": "inspect" }))?;
@@ -620,7 +633,13 @@ fn failed_start(cfg: &DispatchConfig, tid: &str, stage: StartStage, reason: &str
             }
         }
         let retained_work = probe_retained_work(path);
-        let failure_class = if reason.contains("gate:") { "prerequisite" } else { "transport" };
+        let failure_class = if config_lock_refusal(reason) {
+            "resource"
+        } else if reason.contains("gate:") {
+            "prerequisite"
+        } else {
+            "transport"
+        };
         execution_call(cfg, tid, json!({ "kind": "start_failed", "stage": stage, "reason": truncate(reason, 3500), "retained_work": retained_work, "failure_class": failure_class }))
     })();
     // Progress after release would re-claim todo through the legacy API.
@@ -5794,6 +5813,24 @@ mod tests {
         assert!(lock.exists(), "a fresh lock belongs to a live writer — never unlink it");
         let _ = std::fs::remove_dir_all(&clone);
         let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn config_lock_refusals_classify_as_resource_failures() {
+        // BR#6992 root-fix #2: the live incident reason must report
+        // failure_class "resource" from failed_start, so the hub stamps a
+        // 60s cooldown instead of a repair_required barrier that only a
+        // refused begin could clear (closed loop).
+        let incident = "gate: identity profile failed: git config user.email failed: error: could not lock config file /srv/work/repos/state-vector-superpositional-3f2a/.git/config: File exists";
+        assert!(config_lock_refusal(incident));
+        // the closed list must not widen into arbitrary prose matching:
+        // either half of the shape alone, a different identity defect, and
+        // an unrelated gate are not lock refusals.
+        assert!(!config_lock_refusal("could not lock config file"), "half the evidence shape is not the shape");
+        assert!(!config_lock_refusal("File exists while signing the receipt"));
+        assert!(!config_lock_refusal("gate: identity profile failed: git config user.name failed"));
+        assert!(!config_lock_refusal("gate: identity sign check failed (exit 255)"));
+        assert!(!config_lock_refusal("gate: prerequisite missing"));
     }
 
     fn throwaway_signing_key(tag: &str) -> std::path::PathBuf {
