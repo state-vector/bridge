@@ -19955,6 +19955,15 @@ export class KnowledgeHub {
         parked_children: parkedChildren.map((c) => String(c.id)),
         parked_since: Number(parked.since ?? 0) || null,
       });
+      // BR#17043: the park-clear is a one-time observable lifecycle event —
+      // stamp it on card history too (the park/refusal legs stamp audit +
+      // version pairs; a resume visible only in the audit ledger made the
+      // ladder's re-arm unverifiable from the card).
+      this.version(parentId, actor, "merged_admission_park_cleared",
+        parkedChildren.length
+          ? `typed park cleared — every parked child went terminal (${parkedChildren.map((c) => String(c.id)).join(", ")}); the bounded carry ladder re-armed fresh and the carry resumes on the landed legs stamp (BR#17043)`
+          : `typed park cleared — the gate-cleared re-arm window elapsed; the bounded carry ladder re-armed fresh and the carry resumes on the landed legs stamp (BR#17043)`,
+        { via, parked_children: parkedChildren.map((c) => String(c.id)), parked_since: Number(parked.since ?? 0) || null });
     }
     const parentRoles = parseTags(String(row.roles ?? ""));
     const humanSignoff = effectiveRole(parentRoles) === "human";

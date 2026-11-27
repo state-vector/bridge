@@ -1980,6 +1980,24 @@ of its own (the executor never self-certifies), answers the ask, and leaves the 
 as the record — the storm ends, the history survives. The trains panel renders the count
 live: a ×N ledger-bounce chip per queued PR (red once over budget) — on the queue rows and
 the merge-batch blocks alike — plus the escalation clock chips while an episode is open.
+**The carry's terminal-admission close is bounded** (BR#17043 — BR#4403 law applied to the
+merged-provenance carry): a semantic gate refusal (done-open-children et al.) on the carried
+close is audited and retried by the sweep at most **3** times; the next refusal PARKS the
+admission ONCE as a typed machine wait — `br_done` on the first named child, or a 30-minute
+re-arm when the gate named none — with a single close-bounce brief naming the child, its
+owner and the next action (BR#8071 pattern; the BR#16873 specimen: 7h+ of ~60s audited
+`merged_admission_close_refused` events on a cured root blocker). Further ticks fold
+silently at the entry check; when every parked child goes terminal (or the window lapses)
+the park clears — audit + version stamped once — and the ladder re-arms fresh. Infra/5xx
+refusals stay retryable-audited and never advance the bound, and a closed card carries no
+refusal counter or park marker forward. Membership never fences its root's done either
+(BR#4894 spec b): rootBlockerRollup membership edges ride `relates` (the `meta.root_blocker`
+pointer keeps the board-tree link), the `root_edges_v1` migration rewrote existing
+membership edges, duty/episode spawn edges are relate-linked rather than `child_of`, and
+the done-gate census already skips `machine_duty` children (BR#5370) — a cured root blocker
+is closable no matter how many duty cards were spawned about it. A parent carrying more
+than 50 `child_of` edges is audited (`child_of_fanout_high`, audit-only — the BR#4728
+specimen carried 189).
 The trains panel is honest about capability and activity (BR#4981): a held lock names
 its machine; an idle lane ticked by a merge-capable gateway inside the 15-minute window
 shows the pill `train ready` (the tooltip names the machine and its last tick age);
