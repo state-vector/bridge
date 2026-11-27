@@ -135,7 +135,21 @@ beforeEach(async () => {
         // bounded reopen pass must pay for matching capability-wait rows only,
         // never a full maintenance page of unrelated tasks.
         if (path === "/fixture/capability-cost") {
-          const { host, with_reserve = false } = await request.json();
+          const { host, with_reserve = false, seed_legacy_parks = 0, project = "" } = await request.json();
+          if (seed_legacy_parks && project) {
+            // BR#23279 — seed the RETIRED park shape (blocked on a typed
+            // executor_capability wait, exactly the legacy rows the reopen
+            // duty drains as a migration in production); the live grammar
+            // refuses to create new parks, so the probe synthesizes them.
+            this.state.storage.sql.exec(
+              \`UPDATE artefacts SET status='blocked', owner='', status_ts=1,
+                 meta=json_set(json_remove(meta,'$.execution_wait'), '$.blocked',
+                   json('{"reason":"legacy capability park (BR#23279 probe)","unblock_condition":"A live eligible executor capability becomes usable","ts":1,"await_event":{"event":"executor_capability","id":"' || id || '"}}'))
+               WHERE id IN (SELECT id FROM artefacts WHERE type='task' AND status='todo' AND project=?
+                 AND json_extract(meta,'$.execution_requirements') IS NOT NULL ORDER BY rowid LIMIT ?)\`,
+              project, seed_legacy_parks,
+            );
+          }
           const work = this.executionWork();
           const proto = Object.getPrototypeOf(work);
           const sqlDesc = Object.getOwnPropertyDescriptor(proto, "sql");
@@ -173,11 +187,15 @@ beforeEach(async () => {
           // Age the card past the dispatch grace so the invariant sweep sees
           // a root-fix that demonstrably was not claimed by a reserve poll.
           this.state.storage.sql.exec("UPDATE artefacts SET updated_ts=? WHERE id=?", Date.now() - age_ms, id);
-          const started = Date.now();
+          // BR#23279: window by ledger SEQ, not ts — a ts>=started window leaks
+          // a prior sweep's row when both fixture calls land in the same
+          // millisecond (observed flake: the throttle held, but the first
+          // alarm row rode the repeat sweep's read and failed the assertion).
+          const beforeSeq = Number(this.state.storage.sql.exec("SELECT MAX(seq) AS s FROM ledger").toArray()[0]?.s ?? 0);
           this.rootFixDispatchStarvationSweep(Date.now());
           const alarms = this.state.storage.sql.exec(
-            "SELECT artefact_id, action FROM ledger WHERE kind='signal' AND action='root_fix_dispatch_starved' AND ts>=? ORDER BY seq DESC",
-            started,
+            "SELECT artefact_id, action FROM ledger WHERE kind='signal' AND action='root_fix_dispatch_starved' AND seq>? ORDER BY seq DESC",
+            beforeSeq,
           ).toArray();
           return Response.json({ ok: true, alarms });
         }
@@ -198,10 +216,13 @@ beforeEach(async () => {
           }
           if (backdate_attention_s) this.state.storage.sql.exec("UPDATE dispatch_health SET attention_at=?", now - backdate_attention_s * 1000);
           if (backdate_alarm_ms) this.state.storage.sql.exec("UPDATE ledger SET ts=? WHERE kind='signal' AND action='dispatch_starved'", now - backdate_alarm_ms);
-          const started = now;
+          // BR#23279: window by ledger SEQ, not ts — a ts>=started window leaks
+          // a prior tick's row when both fixture calls land in the same
+          // millisecond (the throttle held; the stale row failed the assert).
+          const beforeSeq = Number(this.state.storage.sql.exec("SELECT MAX(seq) AS s FROM ledger").toArray()[0]?.s ?? 0);
           this.reconcileSchedulingHealth(Date.now());
           const alarms = this.state.storage.sql.exec(
-            "SELECT action, data FROM ledger WHERE kind='signal' AND action IN ('dispatch_starved','retry_budget_pile','admission_at_capacity') AND ts>=? ORDER BY seq", started,
+            "SELECT action, data FROM ledger WHERE kind='signal' AND action IN ('dispatch_starved','retry_budget_pile','admission_at_capacity') AND seq>? ORDER BY seq", beforeSeq,
           ).toArray().map(row => ({ action: String(row.action), data: JSON.parse(String(row.data)) }));
           const health = this.state.storage.sql.exec(
             "SELECT d.token_id, d.since, d.attention_at FROM dispatch_health d JOIN auth_tokens t ON t.id=d.token_id WHERE t.revoked_ts IS NULL",
@@ -477,12 +498,15 @@ describe("eligibility-first scheduling on real SQLite", () => {
     };
     expect(await boardTask()).toMatchObject({ gateway_dispatch: { kind: "held", reasons: [hold] } });
     const needsHost = await task(project, { execution_requirements: { tier: "small", tools: ["fixture-missing-tool"], environment: [] } });
-    expect(await boardTask(needsHost)).toMatchObject({ status: "blocked", meta: {
-      execution_wait: { kind: "capability" }, execution_blockers: [{ kind: "capability_unavailable" }],
+    // BR#23279: the unavailable capability never parks the card — todo with
+    // the blockers riding meta, dispatch-held.
+    expect(await boardTask(needsHost)).toMatchObject({ status: "todo", meta: {
+      execution_blockers: [{ kind: "capability_unavailable" }],
     } });
+    expect(await boardTask(needsHost)).not.toHaveProperty("meta.execution_wait");
     expect((await g.cmd({ kind: "pause_claims", budget_ms: 60_000, reason: "fixture: temporarily unavailable" })).kind).toBe("claims_paused");
     expect(await boardTask()).toMatchObject({ gateway_dispatch: { kind: "held", reasons: [hold] } });
-    expect(await boardTask(needsHost)).toMatchObject({ status: "blocked" });
+    expect(await boardTask(needsHost)).toMatchObject({ status: "todo" });
     await g.cmd({ kind: "resume_claims" });
 
     const additional = [];
@@ -899,10 +923,14 @@ describe("eligibility-first scheduling on real SQLite", () => {
   it("acknowledges capability renewal without reconciling the backlog on the liveness request", async () => {
     const project = "bounded-control-plane", g = await gateway(project);
     const id = await task(project, { execution_requirements: { tier: "small", tools: ["aws"], environment: [] } });
-    expect((await post("get", { id })).status).toBe("blocked");
+    // BR#23279: readiness never parks — claimable todo, dispatch-held on the
+    // unavailable capability (the board's gateway_dispatch view carries it).
+    expect((await post("get", { id })).status).toBe("todo");
+    const before = SchedulingOutcomeSchema.parse(await g.cmd({ kind: "schedule", mode: "inspect" }));
+    expect(before.kind === "ready" ? before.candidates ?? [] : []).not.toContain(id);
     const capabilities = { ...g.capabilities, tools: ["git", "aws"] };
     expect((await g.cmd({ kind: "advertise", capabilities })).ok).toBe(true);
-    expect((await post("get", { id })).status).toBe("blocked");
+    expect((await post("get", { id })).status).toBe("todo");
     // The scheduler owns bounded reconciliation before choosing work; moving
     // it off advertisement must not strand newly eligible tasks.
     const ready = SchedulingOutcomeSchema.parse(await g.cmd({ kind: "schedule", mode: "inspect" }));
@@ -914,25 +942,35 @@ describe("eligibility-first scheduling on real SQLite", () => {
     const ids: string[] = [];
     for (let i = 0; i < 60; i++) ids.push(await task(project, { execution_requirements: { tier: "small", tools: ["aws"], environment: [] } }));
     for (let pass = 0; pass < 4; pass++) await post("admin.execution_sweep", {});
-    expect((await Promise.all(ids.map(id => post("get", { id })))).every(t => t.status === "blocked")).toBe(true);
+    // BR#23279: never-started work stays todo — the unavailable capability
+    // rides meta.execution_blockers, refreshed page-by-page by the sweep's
+    // fair cursor (25 rows per pass).
+    const stuck = (t: { meta?: { execution_blockers?: { kind: string }[] } }) =>
+      (t.meta?.execution_blockers ?? []).some(b => b.kind === "capability_unavailable");
+    let states = await Promise.all(ids.map(id => post("get", { id })));
+    expect(states.every(t => t.status === "todo")).toBe(true);
+    expect(states.every(stuck)).toBe(true);
     await g.cmd({ kind: "advertise", capabilities: { ...g.capabilities, tools: ["git", "aws"] } });
     await post("admin.execution_sweep", {});
-    const first = await Promise.all(ids.map(id => post("get", { id })));
-    const advanced = first.filter(t => t.status === "todo").length;
+    states = await Promise.all(ids.map(id => post("get", { id })));
+    const advanced = states.filter(t => !stuck(t)).length;
     expect(advanced).toBeGreaterThan(0);
     expect(advanced).toBeLessThanOrEqual(25);
     for (let pass = 0; pass < 4; pass++) await post("admin.execution_sweep", {});
-    expect((await Promise.all(ids.map(id => post("get", { id })))).every(t => t.status === "todo")).toBe(true);
+    states = await Promise.all(ids.map(id => post("get", { id })));
+    expect(states.every(t => !stuck(t))).toBe(true);
+    expect(states.every(t => t.status === "todo")).toBe(true);
   });
 
-  it("reopens and claims a newly serviceable wait through one shared fleet pass per reserve", async () => {
+  it("claims newly serviceable work through one shared fleet pass per reserve", async () => {
     const project = "reserve-shared-pass", g = await gateway(project, 3);
     const id = await task(project, { execution_requirements: { tier: "small", tools: ["aws"], environment: [] } });
-    expect((await post("get", { id })).status).toBe("blocked");
-    // Capability renewal advertises without reconciling the backlog; the
-    // reserve's own bounded duty must flip the wait and claim it.
+    // BR#23279: the card was never parked — todo, dispatch-held until the
+    // fleet can serve it. No reopen flip exists to pay: the reserve's own
+    // bounded duty selects the card directly once capability renews.
+    expect((await post("get", { id })).status).toBe("todo");
     await g.cmd({ kind: "advertise", capabilities: { ...g.capabilities, tools: ["git", "aws"] } });
-    expect((await post("get", { id })).status).toBe("blocked");
+    expect((await post("get", { id })).status).toBe("todo");
     const reserveFixture = async () => JSON.parse(await (await stub.fetch("https://kb/fixture/reserve-inventory", {
       method: "POST", body: JSON.stringify({ host: g.host }),
     })).text()) as { scans: number; readinessReads: number; policyReads: number; kind: string; task_id: string | null; reasons?: Record<string, number> };
@@ -959,12 +997,13 @@ describe("eligibility-first scheduling on real SQLite", () => {
     expect((await post("get", { id: extra[0] })).status).toBe("in_progress");
   });
 
-  it("advances the reopen cursor fairly across reserves and never flips an ask-owned wait", async () => {
+  it("advances selection fairly across reserves and never claims an ask-owned card", async () => {
     const project = "reopen-fairness", g = await gateway(project, 4);
     const ids: string[] = [];
     for (let i = 0; i < 30; i++) ids.push(await task(project, { execution_requirements: { tier: "small", tools: ["aws"], environment: [] } }));
-    // The held wait carries an open human decision: it occupies the reopen
-    // page and advances the cursor, but no reserve may flip it.
+    // The held card carries an open human decision: BR#23279 keeps it todo
+    // (never parked), but its typed wait — the human_decision work wait —
+    // owns the exit: no reserve may claim it while the ask is open.
     const held = ids[15];
     const ask = await post("create", { actor: "author", type: "question", title: "Resume the held repair despite the outstanding policy choice?",
       meta: { ask: { route: { kind: "human_decision" }, decision: {
@@ -986,12 +1025,20 @@ describe("eligibility-first scheduling on real SQLite", () => {
       if (outcome.kind === "reserved") claimed.push(outcome.task_id);
     }
     expect(claimed).toEqual(ids.slice(0, 3));
+    // The ask-owned card stays unclaimed and unblocked — the wait is typed
+    // on the card, and its exit belongs to the answer, never the scheduler.
+    expect(claimed).not.toContain(held);
     const states = await Promise.all(ids.map(id => post("get", { id })));
-    expect(states.filter(t => t.status === "blocked").map(t => t.id)).toEqual([held]);
+    expect(states.filter(t => t.status === "blocked").map(t => t.id)).toEqual([]);
     expect(states.filter(t => t.status === "in_progress").map(t => t.id)).toEqual(ids.slice(0, 3));
-    expect(states.filter(t => t.status === "todo").map(t => t.id)).toEqual(ids.slice(3).filter(id => id !== held));
-    const heldState = await post("get", { id: held });
-    expect(heldState.meta?.execution_wait).toMatchObject({ kind: "capability" });
+    expect(states.filter(t => t.status === "todo").map(t => t.id)).toEqual(ids.slice(3));
+    // The wait is typed on the card (board work_waits) and holds dispatch
+    // (independent_wait) — its exit belongs to the answer, never the scheduler.
+    const board = await (await stub.fetch("https://kb/board", { method: "GET" })).json() as { tasks: { id: string; work_waits?: { kind: string; exit: { event: string; ask_id: string } }[]; gateway_dispatch?: { kind: string; reasons?: string[] } }[] };
+    const heldBoard = board.tasks.find(t => t.id === held);
+    expect(heldBoard?.work_waits?.find(w => w.kind === "human_decision" && w.exit.ask_id === ask.id)).toBeTruthy();
+    expect(heldBoard?.gateway_dispatch).toMatchObject({ kind: "held" });
+    expect(heldBoard?.gateway_dispatch?.reasons).toContain("independent_wait");
   });
 
   it("pays the reopen duty for matching capability waits only, never a full maintenance page", async () => {
@@ -1011,8 +1058,11 @@ describe("eligibility-first scheduling on real SQLite", () => {
     const ids: string[] = [];
     for (let i = 0; i < 30; i++) ids.push(await task(project, { execution_requirements: { tier: "small", tools: ["aws"], environment: [] } }));
     await g.cmd({ kind: "advertise", capabilities: { ...g.capabilities, tools: ["git", "aws"] } });
-    probe = await (await stub.fetch("https://kb/fixture/capability-cost", { method: "POST", body: JSON.stringify({ host: g.host }) })).json() as { sweepStatements: number; reopenStatements: number; reserveStatements: number };
-    // Flipping the matching page costs per-matching-row work, bounded by the
+    // BR#23279: new work never parks — the probe seeds the retired legacy
+    // shape directly so it still measures the migration drain the reopen
+    // duty pays in production on historical rows.
+    probe = await (await stub.fetch("https://kb/fixture/capability-cost", { method: "POST", body: JSON.stringify({ host: g.host, seed_legacy_parks: 30, project }) })).json() as { sweepStatements: number; reopenStatements: number; reserveStatements: number };
+    // Draining the matching page costs per-matching-row work, bounded by the
     // 25-row page — never the 120-row retained todo board behind it.
     expect(probe.reopenStatements).toBeGreaterThanOrEqual(25);
     expect(probe.reopenStatements).toBeLessThan(500);
@@ -2276,12 +2326,12 @@ describe("priority line recovery capacity", () => {
       },
     });
     expect(stale.error).toBeUndefined();
-    // the stale pin does not merely filter eligibility — the capability sweep
-    // parks the p0 card BLOCKED awaiting an executor_capability that will
-    // never exist (the pinned host is dead)
+    // the stale pin filters eligibility — BR#23279: the p0 card stays todo
+    // (never parked), dispatch-held on the dead holder's host affinity, an
+    // executor capability that will never exist (the pinned host is dead)
     const parked = await post("get", { id: stale.id });
-    expect(parked.status).toBe("blocked");
-    expect(parked.meta.execution_wait).toMatchObject({ kind: "capability" });
+    expect(parked.status).toBe("todo");
+    expect(parked.meta.execution_wait).toBeUndefined();
     expect((await reserve(g)).kind).toBe("no_eligible_work");
     // a new red episode on the same head rebinds this exact card — the rebind
     // must clear the dead holder's dispatch pins (GH#455)

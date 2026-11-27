@@ -13,6 +13,13 @@ async function query(sql: string, args: (string | number)[] = []) {
 const wait = (id: string, created: number, owner = "") => query(
   `INSERT INTO artefacts(id,type,title,body_md,project,roles,status,owner,meta,updated_ts) VALUES(?,'task',?,'body','bridge','[]','blocked',?,json_object('execution_wait',json_object('kind','capability'),'blocked',json_object('await_event',json_object('event','executor_capability'),'id',?),'execution_requirements',json_object('tier','small','tools',json_array('aws'),'environment',json_array())),?)`,
   [id, `wait ${id}`, owner, id, created]);
+/** BR#23279 — the SECOND historical park shape: a typed executor_capability
+ *  await_event with NO execution_wait marker (the legacy agent-authored park
+ *  the old grammar accepted). The reopen drain must page BOTH shapes, and
+ *  the await_event-keyed index must serve them without a board scan. */
+const legacy = (id: string, created: number, owner = "") => query(
+  `INSERT INTO artefacts(id,type,title,body_md,project,roles,status,owner,meta,updated_ts) VALUES(?,'task',?,'body','bridge','[]','blocked',?,json_object('blocked',json_object('await_event',json_object('event','executor_capability'),'id',?),'execution_requirements',json_object('tier','small','tools',json_array('aws'),'environment',json_array())),?)`,
+  [id, `legacy ${id}`, owner, id, created]);
 
 beforeAll(async () => {
   // Exact production reopen SQL and the narrow partial index, executed by
@@ -43,6 +50,9 @@ beforeAll(async () => {
   await query(`WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<200)
     INSERT INTO artefacts SELECT 'owned-'||i,'task','t'||i,'body','bridge','[]','blocked','someone',json_object('execution_wait',json_object('kind','capability'),'blocked',json_object('await_event',json_object('event','executor_capability'),'id','owned-'||i),'execution_requirements',json_object('tier','small','tools',json_array('aws'),'environment',json_array())),i FROM n`);
   for (let i = 0; i < 30; i++) await wait(`wait-${i}`, 1000 + i);
+  // Legacy-shape parks sit AFTER the marker-pair rows in rowid order, so the
+  // paged cursor must cross from one shape into the other seamlessly.
+  for (let i = 0; i < 5; i++) await legacy(`legacy-${i}`, 2000 + i);
 });
 
 afterAll(async () => { await mf?.dispose(); });
@@ -54,11 +64,16 @@ describe("bounded capability-wait reopen on a retained SQLite backlog", () => {
     expect(page.rows.map(r => r.id)).toEqual(Array.from({ length: CAPABILITY_WAIT_REOPEN_PAGE }, (_, i) => `wait-${i}`));
     expect(page.reads).toBeLessThan(100);
     const next = await query(CAPABILITY_WAIT_REOPEN_SQL, [page.rows.at(-1)!.sweep_cursor]);
-    expect(next.rows.map(r => r.id)).toEqual(Array.from({ length: 5 }, (_, i) => `wait-${25 + i}`));
+    // The cursor crosses from the marker-pair shape into the legacy
+    // no-execution_wait shape — both drain through the same page.
+    expect(next.rows.map(r => r.id)).toEqual([
+      ...Array.from({ length: 5 }, (_, i) => `wait-${25 + i}`),
+      ...Array.from({ length: 5 }, (_, i) => `legacy-${i}`),
+    ]);
     expect(next.reads).toBeLessThan(100);
   });
   it("pays nothing beyond the seek when the cursor sits past every matching row", async () => {
-    const past = await query(`SELECT rowid AS sweep_cursor,id FROM artefacts WHERE id='wait-29'`);
+    const past = await query(`SELECT rowid AS sweep_cursor,id FROM artefacts WHERE id='legacy-4'`);
     const empty = await query(CAPABILITY_WAIT_REOPEN_SQL, [past.rows[0].sweep_cursor]);
     expect(empty.rows).toEqual([]);
     expect(empty.reads).toBeLessThan(100);

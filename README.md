@@ -1895,6 +1895,34 @@ leg), or one parked on a typed `await_event` or a bound ask, is never released t
 sweeps **park it `blocked` with the typed proxy intact** (the proxy owns its exit), and the
 machine-actor backstop refuses any release path that slips past them (BR#4067). Humans and
 owners still release freely. The hold-park itself runs only AFTER an atom check (BR#4282): The one exception is the bounce re-entry (BR#4494): a bounce re-opens its card `in_progress` with the prior — usually dead — executor session, and `in_progress` is not claimable; for a `bounced` card the train has already handed the leg back to the board, so when the re-entry sits silent past the stale window the sweep **demotes it to a claimable todo** (bounce brief and boost intact; result class `bounce_reentry_demote`, exempt from abandonment scoring) instead of re-parking it — `queued`/`awaiting-ci` keep the full hold.
+
+**`blocked` is reserved for external typed events, and executor readiness never
+blocks** (BR#23279, Ray's A-law): a card parks `blocked` only on a typed
+`await_event` (external gate — merge-train slot, proxy watch, bound ask, dated
+checkpoint). Executor readiness — capability, host affinity, inventory — is
+scheduler state: never-started work stays claimable `todo` carrying inert
+`meta.execution_blockers` (the board's dispatch view shows the hold; the machine
+grammar rejects an agent-supplied `executor_capability` block), and the
+capability reconcile pen drains the legacy capability parks both historical
+shapes carried. The one narrow first-class carve-out beside the external parks
+is **`interrupted`** — the lost in-flight executor: an in_progress card whose
+dispatched execution went silent with proven mid-work signals parks there
+instead of releasing to todo. The gate is the claim-class stamp
+`meta.execution_claim`, written only from the claimant's server-verified token
+class (a gateway-tagged actor at claim time; a forged body.gateway without the
+token tag no-ops, and caller-supplied stamps are gate-rejected) — plain agent
+and interactive claims can never wear the park. Only watchdog sweeps write it
+(the stall sweep's plain-release path is the primary writer; the owner-death
+leg is the deep-stale backstop); agents cannot. The park carries the resume
+state (owner, session, worktree, last will) under a bounded budget (default
+240m, clamp 10–1440): any live executor claims it through the same claim bars
+(`interrupted → in_progress` consumes the park and re-derives the claim-class
+stamp from the resuming claimant), and past the budget the (B2) alarm sweep
+lapses it to a pool release with the resume record preserved. Both watchdog
+writes carry `result_class` `interrupted_park`/`interrupted_lapse` — exempt
+from abandonment scoring: the executor was lost mid-work, not silent on
+claimed work. Interactive agent claims keep the plain release so the
+abandonment signal still scores.
 the hub holds no VCS credentials, so a `pr_merged` proxy is evaluated against BOARD receipts
 only — the train's own `awaiting-ci` stamp (with `merge_sha`) or the `provenance` row. A
 proxy that is already satisfied is never re-armed: instead of re-parking the card blocked,

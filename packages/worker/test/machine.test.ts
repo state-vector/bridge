@@ -507,6 +507,7 @@ describe("loop regressions", () => {
         "execution-submission-needs-outcome",
         "human-signoff-done",
         "infrastructure-close-protection",
+        "interrupted-park-authority",
         "operator-gated",
         "question-not-claimable",
         "release-needs-ownership",

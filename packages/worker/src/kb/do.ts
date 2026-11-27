@@ -1215,6 +1215,40 @@ export class KnowledgeHub {
         this.audit("system:watchdog", "sweep_error", r.id, { error: String((e as Error).message ?? e) });
       }
     }
+    // (B2) BR#23279 — the interrupted park is BOUNDED: past its budget the
+    // resume window lapses and the card releases to the pool, preserving the
+    // resume record (worktree, last will) on the card for whoever claims it
+    // next. Only watchdog sweeps write the park — the stall sweep's (A)
+    // lost-executor leg is the primary writer and (E) the deep-stale
+    // backstop — always with a deadline; a row without one is malformed and
+    // fails OPEN to the pool — never a
+    // strand. Hold semantics (BR#4067) still own any card that grew a typed
+    // wait / train slot / bound ask while parked: the machine backstop
+    // refuses the release and we wait the exit's own owner out, same law as
+    // the subprocess leg (B) above.
+    const intRows = this.state.storage.sql.exec(
+      `SELECT id, owner, meta, status_ts, updated_ts FROM artefacts WHERE type = 'task' AND status = 'interrupted'`,
+    ).toArray();
+    for (const r of intRows as any[]) {
+      try {
+        const meta = JSON.parse(r.meta ?? "{}");
+        const park = (meta.interrupted ?? {}) as { deadline_ts?: number; budget_minutes?: number; worktree?: string };
+        if (Number(park.deadline_ts ?? 0) > now) continue;
+        const hold = releaseHold(meta);
+        if (hold) {
+          this.audit("system:watchdog", "interrupted_lapse_held", r.id, { hold });
+          continue;
+        }
+        const resumePointer = park.worktree ? `; resume pointer: worktree ${String(park.worktree)}` : "";
+        await this.transition({
+          id: r.id, to: "todo",
+          result_class: "interrupted_lapse",
+          note: `interrupted park lapsed (${park.budget_minutes ?? "?"}m budget, BR#23279) — released to the pool${resumePointer}; the resume record stays on the card`,
+        }, "system:watchdog");
+      } catch (e) {
+        this.audit("system:watchdog", "sweep_error", r.id, { error: String((e as Error).message ?? e) });
+      }
+    }
     // (D) blocked-staleness sweep — BR#2893. Blocked had no clock: churn-guard
     // parks (a retry instruction stamped as a block) and dead ask-refs sat
     // forever, owned by dead runner labels that only they could release — the
@@ -1335,23 +1369,64 @@ export class KnowledgeHub {
         if (now - cardTs <= ownerStaleMs) continue; // the card itself moved — attribution lag, not death
         const silentH = Math.max(1, Math.round((now - ownerTs) / 3_600_000));
         if (r.status === "in_progress") {
-          // BR#6654 — the owner-death release is a machine release like any
-          // other: a card holding a train queue slot / typed wait / bound ask
-          // keeps its exit's owner (the train, the proxy watch, the answer).
-          // Every sibling release path holds BEFORE attempting (stall sweep,
-          // review sweep, park drain, ask-answer dispatch); this leg was the
-          // one path that slipped past its own backstop — each tick it
-          // attempted the release, the BR#4067 guard refused, and the
-          // refusals re-manufactured an audited transition_rejected every
-          // minute (specimen BR#4687: 3 ticks → breach card, 2026-11-05
+          // BR#6654 — the owner-death park is a machine write like any other:
+          // a card holding a train queue slot / typed wait / bound ask keeps
+          // its exit's owner (the train, the proxy watch, the answer). Every
+          // sibling path holds BEFORE attempting (stall sweep, review sweep,
+          // park drain, ask-answer dispatch); this leg was the one path that
+          // slipped past its own backstop — each tick it attempted the
+          // release, the BR#4067 guard refused, and the refusals
+          // re-manufactured an audited transition_rejected every minute
+          // (specimen BR#4687: 3 ticks → breach card, 2026-11-05
           // 14:09–14:11Z; the storm ran until the owner's next live session).
           // A held card is waited out, not re-refused — same law as the park
           // drain (BR#4562).
           if (releaseHold(meta)) continue;
-          await this.transition({
-            id: r.id, to: "todo",
-            note: `watchdog: owner-death release — ${r.owner} has had no live session for ~${silentH}h; claim released to the pool`,
-          }, "system:watchdog");
+          // BR#23279 — a lost in-flight DISPATCHED executor (execution_claim)
+          // parks interrupted, not released: the work was underway, the owner
+          // is provably gone (no live session past owner_stale_hours), and the
+          // in-flight state — worktree, last will — is worth resuming by the
+          // returning owner or a fresh executor. This leg is the deep-stale
+          // BACKSTOP — the stall sweep's (A) plain-release path is the park's
+          // primary writer at the 10m bar, where a lost executor first becomes
+          // provable; this leg catches cards that dodged every stall tick (a
+          // sweep_error hole, a mid-tick protected transition). Bounded: the
+          // (B2) sweep lapses the park to a todo release when the budget
+          // expires. result_class interrupted_park exempts the dead owner's
+          // label from the abandonment counter — the one narrow first-class
+          // carve-out for executors lost mid-work (Ray's A-law: blocked is
+          // reserved for external typed events; executor readiness never
+          // blocks). The gate is the SAME positive execution_claim stamp as
+          // the stall sweep: a plain agent claim keeps the historical
+          // owner-death release below — interactive silence stays scored.
+          if (meta.execution_claim && !meta.interactive_execution) {
+            const budgetMin = this.interruptedBudgetMinutes();
+            const worktreeRow = meta.session
+              ? this.one(`SELECT worktree FROM sessions WHERE name = ? AND worktree IS NOT NULL ORDER BY last_seen_ts DESC LIMIT 1`, String(meta.session)) as { worktree?: string } | null
+              : null;
+            await this.transition({
+              id: r.id, to: "interrupted",
+              result_class: "interrupted_park",
+              note: `watchdog: executor lost — ${r.owner} has had no live session for ~${silentH}h; in-flight work parked (interrupted, BR#23279) with resume state preserved; claim to resume, or the ${budgetMin}m budget releases it to the pool`,
+              interrupted: {
+                owner: String(r.owner),
+                session: meta.session ? String(meta.session) : null,
+                worktree: worktreeRow?.worktree ?? null,
+                resume: {
+                  did: meta.last_progress?.note ? String(meta.last_progress.note).slice(0, 300) : null,
+                  will: meta.last_progress?.will ? String(meta.last_progress.will).slice(0, 300) : null,
+                  ts: meta.last_progress?.ts ?? null,
+                },
+                budget_minutes: budgetMin,
+                deadline_ts: now + budgetMin * 60_000,
+              },
+            }, "system:watchdog");
+          } else {
+            await this.transition({
+              id: r.id, to: "todo",
+              note: `watchdog: owner-death release — ${r.owner} has had no live session for ~${silentH}h; claim released to the pool`,
+            }, "system:watchdog");
+          }
         } else {
           // blocked/in_review: lapse the ownership, keep the status — an
           // unowned park is pool-adjacent state a human or fresh agent can move
@@ -1530,6 +1605,15 @@ export class KnowledgeHub {
   private staleMinutes(): number {
     const s = this.one(`SELECT value FROM settings WHERE key = 'stale_minutes'`);
     return s ? Math.max(1, Math.min(120, parseInt(s.value, 10) || 10)) : 10;
+  }
+
+  /** BR#23279 — the interrupted park's bounded budget (minutes): how long a
+   *  lost in-flight executor's work stays resumable before the park lapses
+   *  to a todo release. Setting `interrupted_budget_minutes`, default 240,
+   *  clamp 10..1440 (the same ceiling a declared subprocess window allows). */
+  private interruptedBudgetMinutes(): number {
+    const s = this.one(`SELECT value FROM settings WHERE key = 'interrupted_budget_minutes'`);
+    return s ? Math.max(10, Math.min(1440, parseInt(s.value, 10) || 240)) : 240;
   }
 
   /** (A1) BR#5226 awaiting-park re-evaluation — the migration for the
@@ -1949,16 +2033,60 @@ export class KnowledgeHub {
       // until X". Release straight to todo: the claim drops, the attempted tag
       // records the try, and the next orient reassigns it. No blocked
       // intermediate, no unblock-child spawn for silence.
+      if (trail) {
+        await this.transition({
+          id: r.id, to: "todo",
+          note: `stalled — no update for >${staleMin}m; completed_result_lost — ${describeResultTrail(trail)}${trail.session ? `; observed under session ${trail.session}` : ""}; result never reached the hub — released to the pool by watchdog (delivery channel flagged, not agent abandonment)${will}`,
+          // GH#494: the observing session rides the event detail — two
+          // completed_result_lost events on one card are disambiguated by WHICH
+          // session's claim-window trail each classification read.
+          ...(trail?.session ? { observed_by: trail.session } : {}),
+          result_class: "completed_result_lost",
+        }, "system:watchdog");
+        continue;
+      }
+      // BR#23279 — the lost-executor carve-out (Ray's A-law): silence on a
+      // DISPATCHED execution (meta.execution_claim — the claim came through a
+      // gateway-tagged token, server-verified at claim time) that had proven
+      // in-flight signals (firstSignal > 0 — the run booted and reported) is
+      // an executor lost mid-work, not an agent gone quiet on claimed work.
+      // Park interrupted — resume state + bounded budget, claimable — instead
+      // of the plain abandoned release. This is the park's PRIMARY writer: the
+      // 10m stall bar is where a lost executor becomes provable; the (E)
+      // owner-death leg keeps the same park as its deep-stale backstop for
+      // cards that dodged every stall tick (sweep_error holes). The gate is
+      // POSITIVE (execution_claim present), never the absence of
+      // interactive_execution: a plain agent or admin claim stamps nothing,
+      // keeps the plain release below, and the abandonment signal still
+      // scores; held cards, machine-wait stalls and completed-result trails
+      // were already routed to their own owners above.
+      if (meta.execution_claim && !meta.interactive_execution && firstSignal > 0) {
+        const budgetMin = this.interruptedBudgetMinutes();
+        const worktreeRow = meta.session
+          ? this.one(`SELECT worktree FROM sessions WHERE name = ? AND worktree IS NOT NULL ORDER BY last_seen_ts DESC LIMIT 1`, String(meta.session)) as { worktree?: string } | null
+          : null;
+        await this.transition({
+          id: r.id, to: "interrupted",
+          result_class: "interrupted_park",
+          note: `watchdog: executor lost — no signal for >${staleMin}m (${r.owner}); in-flight work parked (interrupted, BR#23279) with resume state preserved; claim to resume, or the ${budgetMin}m budget releases it to the pool`,
+          interrupted: {
+            owner: String(r.owner),
+            session: meta.session ? String(meta.session) : null,
+            worktree: worktreeRow?.worktree ?? null,
+            resume: {
+              did: meta.last_progress?.note ? String(meta.last_progress.note).slice(0, 300) : null,
+              will: meta.last_progress?.will ? String(meta.last_progress.will).slice(0, 300) : null,
+              ts: meta.last_progress?.ts ?? null,
+            },
+            budget_minutes: budgetMin,
+            deadline_ts: now + budgetMin * 60_000,
+          },
+        }, "system:watchdog");
+        continue;
+      }
       await this.transition({
         id: r.id, to: "todo",
-        note: trail
-          ? `stalled — no update for >${staleMin}m; completed_result_lost — ${describeResultTrail(trail)}${trail.session ? `; observed under session ${trail.session}` : ""}; result never reached the hub — released to the pool by watchdog (delivery channel flagged, not agent abandonment)${will}`
-          : `stalled — no update for >${staleMin}m${lapsedSub}; released to the pool by watchdog${will}`,
-        // GH#494: the observing session rides the event detail — two
-        // completed_result_lost events on one card are disambiguated by WHICH
-        // session's claim-window trail each classification read.
-        ...(trail?.session ? { observed_by: trail.session } : {}),
-        ...(trail ? { result_class: "completed_result_lost" } : {}),
+        note: `stalled — no update for >${staleMin}m${lapsedSub}; released to the pool by watchdog${will}`,
       }, "system:watchdog");
       } catch (e) {
         // one bad task must not kill the sweep — log and keep going
@@ -3890,7 +4018,7 @@ export class KnowledgeHub {
     openAsks: { id: string; route: ReturnType<typeof askRoute> }[],
   ): WorkWait[] {
     const { id, status, meta, gateway_dispatch: dispatch } = task;
-    if (!["todo", "blocked", "in_review"].includes(status)) return [];
+    if (!["todo", "blocked", "in_review", "interrupted"].includes(status)) return [];
     const waits: WorkWait[] = [];
     for (const ask of openAsks) if (ask.route.kind === "human_decision") {
       waits.push({ kind: "human_decision", exit: { event: "ask_answered", ask_id: ask.id } });
@@ -3899,6 +4027,12 @@ export class KnowledgeHub {
     const startup = StartupWaitSchema.safeParse(meta.startup_wait);
     if (startup.success) waits.push({ kind: "execution_recovery", exit: { event: "startup_ready", previous: startup.data } });
     if (awaited?.event === "executor_capability" || dispatch?.kind === "gateway_unavailable") {
+      waits.push({ kind: "execution_recovery", exit: { event: "compatible_executor_ready", task_id: id } });
+    }
+    if (status === "interrupted") {
+      // BR#23279 — the lost-executor park: a live executor claiming the card
+      // resumes it (compatible_executor_ready names exactly that exit); until
+      // then the (B2) budget clock owns the lapse to todo.
       waits.push({ kind: "execution_recovery", exit: { event: "compatible_executor_ready", task_id: id } });
     }
     const repair = meta.blocked?.repairing;
@@ -4395,6 +4529,12 @@ export class KnowledgeHub {
         // ≤60m heartbeat/grace window. The claim correctly dropped, but the
         // silence is the wait pattern, not abandonment: no counter moves.
       }
+      else if (d?.result_class === "interrupted_park" || d?.result_class === "interrupted_lapse") {
+        // BR#23279: the interrupted park (and its budget lapse) is the
+        // lost-executor carve-out — the executor died mid-work with resume
+        // state preserved and a bounded budget, not abandoned anything. The
+        // returning owner or a fresh executor resumes; no counter moves.
+      }
       else s.abandoned++;
     }
     for (const r of this.state.storage.sql.exec(
@@ -4538,7 +4678,7 @@ export class KnowledgeHub {
         try { d = JSON.parse(r.detail ?? "{}"); } catch { d = {}; }
         if (String(d?.released_owner || r.owner || "") !== label) continue; // pre-stamp rows attributed by current owner only
         const counts = d?.result_class === "completed_result_lost" ? "result_lost"
-          : d?.result_class ? "none" // proxy_wait_hold / bounce_reentry_demote / machine_wait_stall — no-counter classes (BR#4067/BR#4494/GH#491)
+          : d?.result_class ? "none" // proxy_wait_hold / bounce_reentry_demote / machine_wait_stall / interrupted_park / interrupted_lapse — no-counter classes (BR#4067/BR#4494/GH#491/BR#23279)
           : "abandoned";
         if (counts === "result_lost") signals.result_lost++;
         else if (counts === "abandoned") signals.abandoned++;
@@ -5243,6 +5383,18 @@ export class KnowledgeHub {
       CAPABILITY_WAIT_INDEX_SCHEMA,
     ]) {
       try { this.state.storage.sql.exec(ddl); } catch { /* view or shape — the ledger index covers it */ }
+    }
+    // BR#23279 — the capability-wait index key moved (see
+    // CAPABILITY_WAIT_INDEX_SCHEMA): IF NOT EXISTS keeps the old
+    // kind-keyed definition on existing DBs, and that index cannot serve
+    // the widened two-shape reopen predicate — replace it once where the
+    // stored SQL predates the new key. Same recovery as the lane_cards
+    // view pin (BR#16935).
+    const capabilityWaitIdx = this.one(`SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_artefact_capability_waits'`);
+    if (capabilityWaitIdx && !String(capabilityWaitIdx.sql).includes("ON artefacts(json_extract(meta,'$.blocked.await_event.event'))")) {
+      this.state.storage.sql.exec(`DROP INDEX IF EXISTS idx_artefact_capability_waits`);
+      this.state.storage.sql.exec(CAPABILITY_WAIT_INDEX_SCHEMA);
+      this.audit("system:migration", "capability_wait_index_v2", null, { key: "blocked.await_event.event", why: "BR#23279 two-shape reopen predicate" });
     }
     this.state.storage.sql.exec(LEDGER_LOOKUP_SCHEMA + STALL_SESSION_LOOKUP_SCHEMA + BREACH_CARD_LOOKUP_SCHEMA);
 
@@ -8271,13 +8423,20 @@ export class KnowledgeHub {
     if (body.meta && "interactive_execution" in Object(body.meta) || Array.isArray(body.meta_delete) && body.meta_delete.includes("interactive_execution")) {
       throw new Error("gate: interactive ownership is lifecycle infrastructure, never caller-supplied metadata");
     }
+    // BR#23279 — same law for the dispatched-claim stamp: it is keyed to the
+    // claim's server-verified token class and decides the watchdog's
+    // interrupted park (and its scoring exemption). A caller-supplied
+    // execution_claim would be a forged park — and a forged exemption.
+    if (body.meta && "execution_claim" in Object(body.meta) || Array.isArray(body.meta_delete) && body.meta_delete.includes("execution_claim")) {
+      throw new Error("gate: the dispatched-claim stamp is lifecycle infrastructure, never caller-supplied metadata");
+    }
     if (op === "update") {
       const task = this.one(`SELECT meta FROM artefacts WHERE id=?`, String(body.id ?? ""));
       const stored = JSON.parse(task?.meta ?? "{}");
       const deletions = Array.isArray(body.meta_delete) ? body.meta_delete : [];
       if (deletions.includes("execution_requirements") && stored.execution_requirements) throw new Error("gate: execution requirements cannot be deleted to bypass capability eligibility");
       if (this.protectedExecution(String(body.id ?? ""), stored)) {
-        for (const key of ["blocked", "execution_wait", "local_execution", "interactive_execution"]) {
+        for (const key of ["blocked", "execution_wait", "local_execution", "interactive_execution", "execution_claim"]) {
           if (deletions.includes(key) || (body.meta && key in Object(body.meta) && JSON.stringify((body.meta as Record<string, unknown>)[key]) !== JSON.stringify(stored[key]))) throw new Error("gate: execution lifecycle infrastructure changes only through its explicit typed controls");
         }
       }
@@ -9609,6 +9768,11 @@ export class KnowledgeHub {
       if (verdict.toSession) next.session = verdict.toSession;
       // Ownership follows the takeover, including heartbeat/release authority.
       delete next.interactive_execution;
+      // BR#23279 — the claim's class converts with the takeover: an
+      // interactive taker holds the card interactively, so the dispatched-
+      // execution park stamp dies with the old claim (the sweep's gate reads
+      // the live holder's evidence, never the prior executor's).
+      delete next.execution_claim;
       if (verdict.toSession && this.executionWork().isInteractive(tokenId)) {
         next.interactive_execution = { kind: "interactive", token_id: tokenId, session: verdict.toSession, claimed_at: ts };
       }
@@ -10480,14 +10644,18 @@ export class KnowledgeHub {
           : `target ${id} is not named in authorization ask ${askId}'s scope (${authorized.length} card${authorized.length === 1 ? "" : "s"}) — batch authority is receipt-scoped to the named census, never pattern-matched`,
       );
     }
-    // State recheck: the ruling applies to open parks only. A card that went
+    // State recheck: the ruling applies to quiet work only. A card that went
     // terminal, was claimed, or was rebound since the authorization must NOT
-    // take the old ruling — skip it and say why.
+    // take the old ruling — skip it and say why. BR#23279: `todo` joins the
+    // acceptable set — never-started dead work no longer parks blocked (the
+    // per-card path and supersedeTask's privileged pen already accept todo);
+    // an `interrupted` park still refuses: its resume window owns the card
+    // until the budget lapses or a claimant resumes it.
     if (row.status === "superseded" && prior.batch_auth?.ask === askId) {
       return { id, status: "superseded", batch_auth: { ...prior.batch_auth, authorized_scope: authorized.length } };
     }
-    if (row.status !== "blocked") {
-      refuse("batch-auth-target-not-parked", `target ${id} is '${row.status}', not an open park — recheck its current state before applying the ruling (the drop edge is blocked → superseded, BR#3913)`);
+    if (row.status !== "blocked" && row.status !== "todo") {
+      refuse("batch-auth-target-not-parked", `target ${id} is '${row.status}', not quiet work — recheck its current state before applying the ruling (the drop edge applies to blocked/todo, BR#3913/BR#23279; interrupted parks wait out their resume budget)`);
     }
     if (Number(prior.blocked?.ts ?? row.status_ts) > authorization.answered_ts) {
       refuse("batch-auth-target-rebound", `target ${id} was parked again after the answer; the prior authorization cannot retire its new wait`);
@@ -10522,7 +10690,7 @@ export class KnowledgeHub {
     if (body?.batch_auth != null && to === "superseded" && row.type === "task") return await this.applyBatchAuthorization(body, actor, row);
     const startupAtStart = this.startupWait(id);
     const localMode = this.executionState(id)?.handoff;
-    const directInteractiveClaim = row.type === "task" && to === "in_progress" && ["todo", "blocked"].includes(row.status)
+    const directInteractiveClaim = row.type === "task" && to === "in_progress" && ["todo", "blocked", "interrupted"].includes(row.status)
       && this.executionWork().isInteractive(String(body.token_id ?? ""));
     if (directInteractiveClaim) this.executionWork().assertInteractiveClaim(id, String(body.token_id), String(body.session ?? ""));
     if ((isExecutionWait(executionMeta) || localMode?.phase === "preparing" || localMode?.phase === "waiting") && !directInteractiveClaim && !(to === "superseded" && actor.startsWith("web:"))) {
@@ -10980,7 +11148,13 @@ export class KnowledgeHub {
       if (verdict.status === "todo") {
         delete meta.session;
       } else {
-        const freshClaim = to === "in_progress" && ["todo", "blocked"].includes(row.status);
+        // BR#23279 — a resume from the interrupted park is a fresh claim in
+        // every sense that matters here: the new holder's session stamps the
+        // card, and the claim-class stamp (execution_claim /
+        // interactive_execution) is re-derived from the RESUMING claimant —
+        // an interactive agent resuming a dispatched executor's park must
+        // not inherit the dispatched park stamp (its own silence scores).
+        const freshClaim = to === "in_progress" && ["todo", "blocked", "interrupted"].includes(row.status);
         if (freshClaim || !meta.session) {
           const sess = await this.resolveSession(body, String(body.token_id ?? ""));
           if (sess) meta.session = String(sess).slice(0, 120);
@@ -10990,6 +11164,23 @@ export class KnowledgeHub {
         // backstop must never see a stale stopped-writer stamp on it.
         if (freshClaim) delete meta.review_bounce_repair;
         if (freshClaim && meta.interactive_execution?.session !== meta.session) delete meta.interactive_execution;
+        // BR#23279 — stamp WHICH KIND of executor holds the claim, from
+        // server-verified authority only: the actor's token tag, not a
+        // body-declared gateway flag (a forged body.gateway without the tag
+        // no-ops, so the stamp cannot be worn to dodge abandonment scoring —
+        // the BR#2673 law). A gateway-dispatched claim carries
+        // meta.execution_claim; every other claim (interactive agent, admin,
+        // plain token) does not. The watchdog's interrupted park is keyed on
+        // this stamp — a DISPATCHED execution lost mid-work parks; any other
+        // silent claim keeps the plain abandoned release so the score law
+        // still measures agent silence.
+        if (freshClaim) {
+          if (body.gateway === true && this.isGatewayActor(actor)) {
+            meta.execution_claim = { agent: attributedAgent ?? actor, ts: Date.now() };
+          } else {
+            delete meta.execution_claim;
+          }
+        }
       }
     }
     // (release ownership, churn escalate/redirect and the attempt stamp are
@@ -14193,7 +14384,7 @@ export class KnowledgeHub {
     // the runner and sat in Backlog "blocked" forever.
     const pool = this.state.storage.sql.exec(
       `SELECT id, type, title, tags, roles, meta, project, updated_ts, status FROM artefacts
-       WHERE type = 'task' AND status IN ('todo','blocked') AND (owner = '' OR status = 'blocked')
+       WHERE type = 'task' AND status IN ('todo','blocked','interrupted') AND (owner = '' OR status IN ('blocked','interrupted'))
         ORDER BY updated_ts DESC`,
     ).toArray().map((t: any) => ({ ...t, tags: parseTags(t.tags), roles: parseTags(t.roles) }));
     // gateway callers dispatch sessions and never claim blocked work —
@@ -24114,7 +24305,20 @@ Keep changes and disposition receipts on the affected task. Finish this recovery
     const key = `${artefactId}:${op}`;
     let seq: number; let ts: number;
     const last = this._lastMutation;
-    if (last && last.key === key && Date.now() - last.ts < 5_000) {
+    // BR#23279: the pairing dedup must prove SAME FACT, not just same action.
+    // A stale _lastMutation from a prior transition on the same card (same
+    // artefact, same action, DIFFERENT from/to — e.g. a claim 7ms before the
+    // watchdog's interrupted park) used to swallow this audit's SIGNAL row —
+    // the row the abandonment counter and every result_class exemption read —
+    // making the release invisible to scoring and the events stream carried
+    // the stale claim's payload instead. The mutation's recorded data must be
+    // fully contained in this audit's detail (the true paired-audit shape:
+    // same from/to/note, additive fields only).
+    const sameFact = (a: object, b: object) => Object.entries(a).every(([k, v]) => {
+      let bv: unknown; try { bv = (b as Record<string, unknown>)[k]; } catch { return false; }
+      return JSON.stringify(v) === JSON.stringify(bv);
+    });
+    if (last && last.key === key && Date.now() - last.ts < 5_000 && sameFact(last.data, detail)) {
       // same fact already recorded as a mutation — broadcast THAT row, no second write
       ({ seq, ts } = last);
       this.broadcastEvent({ seq, ts, actor: last.actor, op: last.action, artefact_id: last.artefactId, detail: last.data });

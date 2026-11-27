@@ -539,7 +539,9 @@ export const RULES: Rule[] = [
   },
   {
     name: "claim-bars",
-    when: (i) => isTask(i) && i.status === "todo" && i.to === "in_progress",
+    // BR#23279: an interrupted card resumes through the same claim bars as a
+    // fresh todo claim — the park preserved the work, not a bypass.
+    when: (i) => isTask(i) && ["todo", "interrupted"].includes(i.status) && i.to === "in_progress",
     guard: async (i, c) => {
       const bars = await c.unmetBars();
       if (!bars.length) return null;
@@ -548,7 +550,9 @@ export const RULES: Rule[] = [
   },
   {
     name: "claim-separation-of-duties",
-    when: (i) => isTask(i) && i.status === "todo" && i.to === "in_progress",
+    // BR#23279: resumed work keeps separation of duties — the session that
+    // did the analysis still cannot claim the impl leg off an interrupted park.
+    when: (i) => isTask(i) && ["todo", "interrupted"].includes(i.status) && i.to === "in_progress",
     guard: async (i, c) => {
       const q = await c.qualify("analysis");
       if (!q.ok || !q.via || q.via === "declared" || String(q.via).startsWith("parent:")) return null;
@@ -580,6 +584,19 @@ export const RULES: Rule[] = [
       noteOf(i)
         ? null
         : `moving out of blocked requires a resolution (note) — the card promised an unblock condition; cite how it resolved`,
+  },
+  {
+    // BR#23279 — the lost-executor park is machinery-written, full stop. An
+    // agent cannot park itself (or anyone) interrupted: the carve-out exists
+    // precisely because a dead executor cannot speak for its card, and a
+    // live one that wants to hand back work releases to todo (rule 9) or
+    // declares silence (rule 4b). Only hub/system actors write this edge.
+    name: "interrupted-park-authority",
+    when: (i) => isTask(i) && i.to === "interrupted",
+    guard: (i) =>
+      /^(system:|hub:)/i.test(String(i.actor ?? ""))
+        ? null
+        : `task ${i.id} cannot be parked interrupted by an agent — the interrupted park (BR#23279) is the watchdog's narrow carve-out for a lost in-flight executor (an in_progress card whose owner has no live session). Keep your claim alive with log_progress heartbeats, declare a silence window, or release to todo yourself (rule 9); the hub parks interrupted only when your session is gone.`,
   },
   {
     name: "execution-submission-needs-outcome",
@@ -628,6 +645,7 @@ export const RULES: Rule[] = [
         if (!ev) return `malformed await_event — the grammar is a closed set: ${AWAIT_GRAMMAR_DOC}`;
         if (ev.event === "issue_closed") return unsupportedIssue;
         if (ev.event === "recovery_required") return "execution recovery waits are created by the scheduler";
+        if (ev.event === "executor_capability") return "executor capability waits are machine-only and retired as a block condition (BR#23279): executor readiness never blocks a card — never-started work stays todo while the scheduler holds dispatch, and a lost in-flight executor parks `interrupted`, which only the watchdog writes. Await a typed external event, or bind an ask";
         if (isSelfAwait(String(i.id), ev)) return selfMsg;
         return null;
       }
@@ -783,7 +801,7 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
   // path that slips past them. A human_verdict body flag (the answered-ask
   // dispatch — the human's typed/clicked RELEASE riding a system actor as
   // its pen) is exempt: the human decided, the machine only typed.
-  if (i.type === "task" && i.to === "todo" && (i.status === "blocked" || i.status === "in_progress") && /^(system:|hub:|watchdog)/i.test(String(i.actor ?? "")) && !i.body?.human_verdict) {
+  if (i.type === "task" && i.to === "todo" && (i.status === "blocked" || i.status === "in_progress" || i.status === "interrupted") && /^(system:|hub:|watchdog)/i.test(String(i.actor ?? "")) && !i.body?.human_verdict) {
     const m = metaOf(i.meta);
     const mtq = ((m.merge_train ?? {}) as Record<string, unknown>);
     const st = String(mtq.state ?? "");
@@ -924,6 +942,17 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
         patch.attempt = undefined; // proven-unblock: fresh start, no attempt stamp
       }
     }
+  } else if (i.to === "interrupted") {
+    // BR#23279 — the lost-executor park: the watchdog is the only writer
+    // (interrupted-park-authority refuses every other actor), so the body's
+    // record is machinery-authored. The owner clears — the executor is gone
+    // and nothing is claimed — while the resume state (last will, session,
+    // worktree) rides the card so the returning owner or a fresh executor
+    // can pick the work back up; the bounded budget (deadline_ts) owns the
+    // lapse to todo. Not an attempt, not a release: an interruption.
+    ownerClear = true;
+    const b = (i.body?.interrupted ?? {}) as Record<string, unknown>;
+    patch.interrupted = { ...b, ts: Number(b.ts ?? now) };
   }
 
   // completion resets the churn counter (BR#2503 residual: the lifetime
@@ -987,6 +1016,10 @@ export async function decide(i: RuleInput, c: RuleCtx): Promise<Verdict> {
     // whose round no longer exists. Dedup keeps suppressing duplicates of an
     // UNCONSUMED round; a consumed one is not a duplicate.
     if (i.to === "in_progress" && i.status === "blocked") patch.last_unblock_spawn = undefined;
+    // BR#23279 — a resume consumes the interrupted park: the claimer has read
+    // the resume state (worktree, last will) off the card's history; the park
+    // record would otherwise read as a live budget that never lapses.
+    if (i.to === "in_progress" && i.status === "interrupted") patch.interrupted = undefined;
   }
   if (i.to === "done" || i.to === "superseded" || (i.status === "in_review" && i.to === "in_progress")) {
     const isBounce = i.status === "in_review" && i.to === "in_progress";

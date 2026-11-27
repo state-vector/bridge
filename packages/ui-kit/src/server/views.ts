@@ -290,6 +290,11 @@ export const EXIT_CLASSES: Record<string, ExitClass> = {
     unblockedBy: "A ready, compatible gateway", unblockedTone: "scope",
     note: "The task has no other recorded admission hold. A compatible gateway must become ready.",
   },
+  interrupted: {
+    key: "interrupted", title: "Executor lost — work parked", icon: "⏸",
+    unblockedBy: "Agent (claim to resume)", unblockedTone: "warn",
+    note: "in-flight work whose executor died (BR#23279): the park is bounded and the resume state is preserved on the card — claim it to resume where the last executor stopped, or the budget releases it back to the pool. Not blocked: executor readiness never blocks a card.",
+  },
   timeout: {
     key: "timeout",
     title: "Timeout — churn parks",
@@ -302,7 +307,7 @@ export const EXIT_CLASSES: Record<string, ExitClass> = {
 
 /** Render order for the Backlog exit-class groups: human levers first, then
  *  machine gates by blast radius, parks last. */
-export const EXIT_CLASS_ORDER = ["ask", "awaiting", "verify", "coordination", "merge", "conflict", "repair", "pr", "ci", "deploy", "task", "issue", "executor", "time", "main", "retry", "operations", "prerequisite", "gateway", "other", "timeout"];
+export const EXIT_CLASS_ORDER = ["ask", "awaiting", "verify", "coordination", "merge", "conflict", "repair", "pr", "ci", "deploy", "task", "issue", "executor", "interrupted", "time", "main", "retry", "operations", "prerequisite", "gateway", "other", "timeout"];
 
 /** Blocked (or in_review) card → the exit class Backlog groups it under.
  *  First match wins; the typed phase and await_event outrank prose. */
@@ -323,6 +328,10 @@ export function exitClassOf(t: { id?: string; status?: string; meta?: any }): Ex
   const unblock = String(b.unblock_condition ?? "");
   const ev = b.await_event?.event as string | undefined;
   if (t.status === "in_review") return EXIT_CLASSES.verify;
+  // BR#23279 — the lost-executor park is its own class: an interruption is
+  // not a block (no external event is awaited) and not a gateway wait (the
+  // executor fleet may be perfectly healthy — this card's executor died).
+  if (t.status === "interrupted") return EXIT_CLASSES.interrupted;
   if (t.status !== "blocked") return EXIT_CLASSES.other;
   if (m.execution_wait?.kind === "capability" && m.blocked?.await_event?.event === "executor_capability"
     && m.blocked.await_event.id === t.id
@@ -382,6 +391,16 @@ export function blockedSummaryOf(t: { status?: string; meta?: any }): {
     whatUnblocks: startup.data.phase === "waiting_executor" ? "System: verified compatible executor readiness" : "Agent: repair startup prerequisite; system: verify changed readiness",
     unblockedTone: startup.data.attention_at !== null ? "urgent" : "warn",
     whyBlocked: startupWaitReason(startup.data),
+  };
+  // BR#23279 — the interrupted park: an interruption is not a block; the
+  // summary routes the reader to the resume record on the card.
+  if (t.status === "interrupted") {
+    const park = (m.interrupted ?? {}) as { owner?: string; worktree?: string | null; budget_minutes?: number; resume?: { will?: string | null } };
+    return {
+      whatUnblocks: park.worktree ? `Agent: claim to resume (worktree ${String(park.worktree)})` : "Agent: claim to resume",
+      unblockedTone: "warn",
+      whyBlocked: `executor lost — ${String(park.owner ?? "the prior owner")} had no live session; resume state preserved, ${String(park.budget_minutes ?? "?")}m budget before the park releases to the pool${park.resume?.will ? `; was about to: ${String(park.resume.will).slice(0, 120)}` : ""}`,
+    };
   };
   const b = m.blocked ?? {};
   const evObj = b.await_event ?? {};

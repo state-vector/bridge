@@ -2,10 +2,9 @@
  * The SQLite transaction owns state + claim + wait + grant consumption. */
 import { CheckpointSchema, ExecutionStateSchema, ExecutionRequirementsSchema, ExecutorCapabilitiesSchema, HandoffAcceptSchema, HandoffControlSchema, HandoffReadSchema, LocalGrantSchema, InteractiveClaimSchema,
   initialExecution, openLargerModelStrategy, capabilityBlockers, usableFor, projectExecutionBlockers, continuationPrompt, selectModelTier, maxTier, DEFAULT_MODEL_POLICY,
-  availableModelTiers, nextAvailableTier, isExecutorAvailabilityBlocker, executionAdmissionHold,
+  availableModelTiers, nextAvailableTier, isExecutorAvailabilityBlocker,
   type ModelPolicy, type ExecutionRequirements, type ExecutionState, type ExecutionBlocker, type LocalGrant, type CapabilityObservation, type ExecutorCapabilities, type ExecutorReadiness } from "@bridge/contracts";
 import { StartupWaitSchema, startupWaitReason, startupPrerequisiteFingerprint } from "@bridge/contracts";
-import { todoDispatchHold } from "./core.ts";
 import { gatewayOccupancy } from "./scheduling.ts";
 import { ExecutionModelIdentitySchema, type ExecutionHistoryEvent } from "@bridge/contracts";
 
@@ -27,8 +26,19 @@ interface TaskColumns { roles: string; body_md: string; project: string; meta: s
  *  never by the retained board span. */
 export const CAPABILITY_WAIT_REOPEN_PAGE = 25;
 export const CAPABILITY_WAIT_REOPEN_CURSOR_KEY = "execution_reopen_cursor";
-export const CAPABILITY_WAIT_REOPEN_SQL = `SELECT rowid AS sweep_cursor,id,title,body_md,project,roles,status,owner,meta,updated_ts FROM artefacts WHERE rowid>? AND type='task' AND status='blocked' AND owner='' AND json_extract(meta,'$.execution_wait.kind')='capability' AND json_extract(meta,'$.blocked.await_event.event')='executor_capability' AND (json_extract(meta,'$.execution_requirements') IS NOT NULL OR EXISTS (SELECT 1 FROM execution_hosts)) ORDER BY rowid LIMIT ${CAPABILITY_WAIT_REOPEN_PAGE}`;
-export const CAPABILITY_WAIT_INDEX_SCHEMA = `CREATE INDEX IF NOT EXISTS idx_artefact_capability_waits ON artefacts(json_extract(meta,'$.execution_wait.kind')) WHERE type='task' AND status='blocked' AND owner='' AND json_extract(meta,'$.execution_wait.kind')='capability' AND json_extract(meta,'$.blocked.await_event.event')='executor_capability'`;
+export const CAPABILITY_WAIT_REOPEN_SQL = `SELECT rowid AS sweep_cursor,id,title,body_md,project,roles,status,owner,meta,updated_ts FROM artefacts WHERE rowid>? AND type='task' AND status='blocked' AND owner='' AND json_extract(meta,'$.blocked.await_event.event')='executor_capability' AND (json_extract(meta,'$.execution_wait.kind')='capability' OR json_extract(meta,'$.execution_wait') IS NULL) AND (json_extract(meta,'$.execution_requirements') IS NOT NULL OR EXISTS (SELECT 1 FROM execution_hosts)) ORDER BY rowid LIMIT ${CAPABILITY_WAIT_REOPEN_PAGE}`;
+/** BR#23279 — the key moved from execution_wait.kind (present in only ONE
+ *  of the two historical park shapes) to the typed executor_capability
+ *  await_event — the invariant EVERY drainable capability park carries. The
+ *  partial WHERE pins exactly the reopen predicate's mandatory terms; the
+ *  two-shape disjunction and the requirements clause stay residual filters
+ *  over the narrow index set. The old kind-keyed index could not serve the
+ *  widened query: its partial WHERE was no longer implied by the query's,
+ *  so the planner fell back to the full retained-board scan (measured
+ *  12,225 rows on the query rig). ensureSchema replaces the old index once
+ *  where the stored SQL predates this key (the lane_cards BR#16935
+ *  recovery pattern). */
+export const CAPABILITY_WAIT_INDEX_SCHEMA = `CREATE INDEX IF NOT EXISTS idx_artefact_capability_waits ON artefacts(json_extract(meta,'$.blocked.await_event.event')) WHERE type='task' AND status='blocked' AND owner='' AND json_extract(meta,'$.blocked.await_event.event')='executor_capability'`;
 export const CAPABILITY_SWEEP_SCHEMA = `
   CREATE INDEX IF NOT EXISTS idx_capability_sweep_open ON artefacts(type)
     WHERE type='task' AND status IN ('todo','blocked');
@@ -504,23 +514,40 @@ export class ExecutionWork {
    *  dispatch sweep does, and taskReadiness skips its per-row re-SELECT. */
   private reconcileTaskCapability(task: TaskRow, now: number, columns?: TaskColumns) {
     const state = this.state(task, columns); const meta: TaskMeta = JSON.parse(task.meta || "{}"); const blockers = this.blockers(task, now, null, state, columns);
-    const unavailable = blockers.find(isExecutorAvailabilityBlocker);
     const prior = JSON.stringify(meta.execution_blockers ?? []); meta.execution_blockers = blockers;
     let status = task.status;
-    const attemptHold = executionAdmissionHold(state, String(meta.work_revision ?? "legacy"));
-    const capabilityWait = status === "blocked" && meta.execution_wait?.kind === "capability"
-      && (meta.blocked as { await_event?: { event?: string } })?.await_event?.event === "executor_capability";
+    const capabilityWait = status === "blocked"
+      && (meta.blocked as { await_event?: { event?: string } })?.await_event?.event === "executor_capability"
+      // BR#23279 — the capability park is retired in BOTH historical shapes:
+      // the reconcile's own marker pair (execution_wait + await_event) and the
+      // legacy agent-authored shape (a typed executor_capability await_event
+      // the old grammar accepted; the machine now refuses new ones). The
+      // machine grammar rejection retires the pen; this branch drains the
+      // historical class through the same privileged pen that always owned
+      // capability waits — the release-hold backstop guards LIVE typed waits,
+      // and a retired wait is deleted in the same write that releases the
+      // card, so the backstop never re-refuses it.
+      && (meta.execution_wait?.kind === "capability" || !meta.execution_wait);
     const independent = blockers.some(b => b.kind === "human_answer_required" || b.kind === "local_pickup_required");
     if (this.startupWait(task.id)) {
       // Startup reconciliation owns this episode.
-    } else if (status === "todo" && unavailable && !attemptHold && !independent && !todoDispatchHold(meta) && !meta.operator_gated) {
-      status = "blocked"; meta.execution_wait = { kind: "capability" };
-      meta.blocked = { reason: unavailable.text, unblock_condition: "A live eligible executor capability becomes usable; all other blockers must also clear", ts: Date.now(), await_event: { event: "executor_capability", id: task.id } };
-    } else if (capabilityWait && !task.owner && !independent && (attemptHold || !unavailable)) {
-      // Remove only the capability sweep's own marker. The scheduler still
-      // enforces the original attempt fence, even while the host is down.
+    } else if (capabilityWait && !task.owner && !independent) {
+      // BR#23279 — executor readiness is never a block condition. The legacy
+      // capability park (never-started work blocked awaiting an executor —
+      // blockedParkVerdict classed it external, so no sweep could ever drain
+      // it) is released to todo UNCONDITIONALLY, not only when availability
+      // returns or an attempt fence holds. The card is claimable; dispatch
+      // admission — this same blockers read — holds it while no executor is
+      // ready, and meta.execution_blockers keeps the readiness evidence
+      // visible to the board and the attention page. The scheduler owns the
+      // wait; the board never did.
       status = "todo"; delete meta.blocked; delete meta.execution_wait;
     }
+    // BR#23279 — a todo card with unavailable blockers STAYS todo: no park,
+    // no execution_wait marker. The blockers ride meta (the write below) and
+    // the held dispatch view is what the board shows. In-flight interruptions
+    // (a live executor lost mid-work) are the watchdog's interrupted park —
+    // a different, bounded state with preserved resume; never this sweep.
     if (prior === JSON.stringify(blockers) && status === task.status) return;
     this.sql.exec(`UPDATE artefacts SET status=?,meta=?,updated_ts=?,status_ts=CASE WHEN status!=? THEN ? ELSE status_ts END WHERE id=?`, status, JSON.stringify(meta), Date.now(), status, Date.now(), task.id);
     // Stable per task/requirements episode; flapping updates the same card,

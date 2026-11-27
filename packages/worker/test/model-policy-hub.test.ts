@@ -133,9 +133,11 @@ it("selects globally, binds the actual model, preserves review floors and blocks
   expect((await post("get_history", { id: impl.id, limit: 100 })).versions).toEqual(expect.arrayContaining([expect.objectContaining({ data: expect.objectContaining({ kind: "execution_yielded", destination: "agent_pool", minimum_tier: "large" }) })]));
   await advertise(false, "remove-large");
   await post("admin.execution_sweep", {});
-  const blocked = await post("get", { id: impl.id });
-  expect(blocked.status).toBe("blocked");
-  expect(blocked.meta.execution_blockers).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "capability_unavailable", reason: "not_configured" })]));
+  const held = await post("get", { id: impl.id });
+  // BR#23279: an escalated floor with no serving tier is a dispatch hold,
+  // not a park — todo with capability blockers visible on the card.
+  expect(held.status).toBe("todo");
+  expect(held.meta.execution_blockers).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "capability_unavailable", reason: "not_configured" })]));
   expect((await post("execution", { ...auth, command_id: "old-writer", command: { kind: "escalate", generation: 1, attempt_id: "one", tier: "large", reason: "Late old writer" } })).error).toMatch(/claim|session/);
   await advertise(true, "restore-large");
   await post("admin.execution_sweep", {});

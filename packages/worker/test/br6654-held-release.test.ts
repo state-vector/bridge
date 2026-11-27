@@ -64,7 +64,7 @@ describe("BR#6654 leg 2 — the owner-death release holds BEFORE attempting (sou
     return -1;
   };
 
-  it("the in_progress owner-death branch runs releaseHold(meta) before its →todo transition", () => {
+  it("the in_progress owner-death branch runs releaseHold(meta) before its →interrupted park", () => {
     const sweepOpen = src.indexOf("{", src.indexOf("private async alarmSweep("));
     expect(sweepOpen).toBeGreaterThan(-1);
     const body = src.slice(sweepOpen + 1, matchBrace(src, sweepOpen));
@@ -78,12 +78,17 @@ describe("BR#6654 leg 2 — the owner-death release holds BEFORE attempting (sou
     expect(branchOpen).toBeGreaterThan(-1);
     const branch = body.slice(branchOpen, matchBrace(body, body.indexOf("{", branchOpen)));
 
-    // the hold check is IN the branch, before the release attempt — a held
+    // the hold check is IN the branch, before the park write — a held
     // card is waited out (the train / proxy watch / answer owns the exit),
-    // never re-refused once per tick
+    // never re-refused once per tick. BR#23279: the write is now the
+    // interrupted park (in-flight work, bounded resume budget) for
+    // DISPATCHED claims (the server-verified execution_claim stamp) —
+    // every other claim keeps the historical todo release — the hold-first
+    // law is unchanged, the pen moved.
     expect(branch).toContain("releaseHold(meta)");
+    expect(branch).toContain("meta.execution_claim");
     const holdIdx = branch.indexOf("releaseHold(meta)");
-    const txIdx = branch.indexOf('to: "todo"');
+    const txIdx = branch.indexOf('to: "interrupted"');
     expect(txIdx).toBeGreaterThan(holdIdx);
     // the check refuses the whole leg (continue), not just annotates
     expect(branch.slice(holdIdx, holdIdx + 40)).toMatch(/releaseHold\(meta\)\)?\s*continue/);
@@ -93,7 +98,13 @@ describe("BR#6654 leg 2 — the owner-death release holds BEFORE attempting (sou
     const sweepOpen = src.indexOf("{", src.indexOf("private async alarmSweep("));
     const body = src.slice(sweepOpen + 1, matchBrace(src, sweepOpen));
     const ownerDeath = body.indexOf("(E) owner-death release");
-    const elseOpen = body.indexOf("} else {", body.indexOf('if (r.status === "in_progress") {', ownerDeath));
+    const branchOpen = body.indexOf('if (r.status === "in_progress") {', ownerDeath);
+    expect(branchOpen).toBeGreaterThan(-1);
+    // BR#23279 — the in_progress branch now carries its OWN inner
+    // dispatched/plain else (park vs todo release). The ownership-lapse
+    // else is the one that FOLLOWS the closed in_progress branch.
+    const branchClose = matchBrace(body, body.indexOf("{", branchOpen));
+    const elseOpen = body.indexOf("} else {", branchClose - 1);
     expect(elseOpen).toBeGreaterThan(-1);
     const elseBranch = body.slice(elseOpen, matchBrace(body, body.indexOf("{", elseOpen)));
     expect(elseBranch).not.toContain('to: "todo"');

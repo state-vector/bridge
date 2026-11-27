@@ -124,7 +124,7 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
       if (t.type === "question") continue;
       const dispatch = t.status === "todo" && t.type !== "question" && !t.meta?.startup_wait
         && t.gateway_dispatch?.kind !== "eligible" ? t.gateway_dispatch as GatewayDispatch | undefined : undefined;
-      if (!dispatch && t.status !== "blocked" && t.status !== "in_review" && !(t.status === "todo" && t.meta?.startup_wait)) continue;
+      if (!dispatch && t.status !== "blocked" && t.status !== "in_review" && t.status !== "interrupted" && !(t.status === "todo" && t.meta?.startup_wait)) continue;
       // Standing merge-lane cards and infra anchors belong to the Trains panel /
       // infra sinks, not the task backlog (BR#6395).
       if (t.meta?.lane?.key || t.meta?.infra_anchor) continue;

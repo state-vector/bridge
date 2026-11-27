@@ -142,7 +142,17 @@ export const LIFECYCLES: Record<ArtefactType, Record<string, string[]>> = {
   // BR#3578 dispatch) or a web/human action may take it — a bare agent
   // session never can. todo/done stay closed (BR#2508: done is a reviewed
   // terminal; a drop never rides the churn-counted release path).
-  task: { todo: ["in_progress", "blocked"], in_progress: ["in_review", "done", "blocked", "todo"], in_review: ["done", "in_progress", "blocked"], blocked: ["in_progress", "todo", "superseded"] },
+  // BR#23279 — `interrupted` is the ONE narrow carve-out beside the external
+  // typed-event parks: a lost in-flight executor (in_progress card whose
+  // owner has no live session) parks here instead of releasing straight to
+  // the pool. Watchdog-only writer (the machine refuses every other actor);
+  // two exits: a claim resumes it (in_progress — the resume state in
+  // meta.interrupted routes the fresh/returning executor), or the bounded
+  // budget lapses it to todo. Never scored as abandonment (result_class
+  // interrupted_park). Executor READINESS itself is never a block condition:
+  // never-started work stays todo and the scheduler holds dispatch — that is
+  // the law this status completes.
+  task: { todo: ["in_progress", "blocked"], in_progress: ["in_review", "done", "blocked", "todo", "interrupted"], in_review: ["done", "in_progress", "blocked"], blocked: ["in_progress", "todo", "superseded"], interrupted: ["todo", "in_progress"] },
   // questions are answered, never claimed: todo → done (answer) or superseded (closed by ADR)
   question: { todo: ["done", "superseded"] },
   progress: {},

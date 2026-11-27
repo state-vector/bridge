@@ -531,6 +531,16 @@ configured stale-work interval (default ten minutes). Backlog and task details
 explain the actual prerequisite; no credential setup request is inferred from a
 generic startup error. Release is a dispatch opportunity, not repair completion.
 
+Executor readiness never blocks work (BR#23279): never-started cards stay
+claimable with an unavailable capability recorded as dispatch metadata (the
+board shows the hold), and the historical capability parks are drained
+automatically by the reconcile pen. A lost in-flight executor — claimed work
+whose dispatched run went silent mid-task — parks `interrupted` with its
+resume state (worktree, last will) under a bounded budget: a live executor
+claims it to resume exactly where it stopped, and the budget releases it to
+the pool when it expires. Losing a run mid-work never reads as abandonment on
+anyone's score.
+
 Paired operators can verify readiness and recover only recorded, never-launched
 legacy credential failures through bounded CLI commands. Local zero-worker and
 child-process checks plus the hub's no-attempt gate preserve actual writers and

@@ -257,11 +257,15 @@ describe("local handoff authority and lifecycle", () => {
     expect((await post("progress.log", { ...pickup, note: "Local source available" })).data.kind).not.toBe("commentary");
     expect((await post("get", { id })).data.meta).not.toHaveProperty("startup_wait");
   });
-  it("lets human-directed agents claim a capability wait directly, heartbeat and release without a grant loop", async () => {
+  it("lets human-directed agents claim readiness-held todo work directly, heartbeat and release without a grant loop", async () => {
     const local = await interactive(`direct-capability-${++serial}`);
     const task = (await post<{ id: string }>("create", { actor: "test", type: "task", title: "Interactive recovery of an unavailable gateway", qualified: true, project: "bridge",
       meta: { execution_requirements: { tier: "large", environment: ["offline-only"] }, attempt: { attempts: 7, last_reason: "Old gateway retries before the human-directed repair" } } })).data;
-    expect((await post("get", { id: task.id })).data.status).toBe("blocked");
+    // BR#23279: executor readiness never blocks — the card stays claimable
+    // todo while no compatible executor exists; the blockers ride meta.
+    const held = (await post<{ status: string; meta: { execution_blockers?: { kind: string }[] } }>("get", { id: task.id })).data;
+    expect(held.status).toBe("todo");
+    expect(held.meta.execution_blockers ?? []).toEqual(expect.arrayContaining([expect.objectContaining({ kind: expect.stringMatching(/capability_unavailable|executor_not_ready/) })]));
     const auth = { id: task.id, actor: local.label, token_id: local.token_id, session: "human-directed-recovery" };
     const claimed = await post("transition", { ...auth, to: "in_progress", note: "Human requested this recovery interactively" });
     expect(claimed.data.error).toBeUndefined();
@@ -447,9 +451,9 @@ describe("local handoff authority and lifecycle", () => {
       expect(history.data.versions.filter(v => v.action === "execution" && v.data.kind === kind)).toHaveLength(1);
     }
   });
-  it("blocks unsupported seeded requirements immediately and restores only its capability wait", async () => {
+  it("keeps unsupported seeded requirements claimable — readiness never blocks (BR#23279)", async () => {
     const task = (await post<{ id: string; status: string }>("create", { actor: "test", type: "task", title: "Needs unavailable environment", project: "bridge", qualified: true, meta: { execution_requirements: { tier: "large", tools: ["cargo"], environment: ["special-access"] } } })).data;
-    expect(task.status).toBe("blocked");
+    expect(task.status).toBe("todo");
     const gateway = (await post<{ secret: string }>("admin.mint", { label: "cap-restoration", tags: ["gateway"] })).data;
     const identity = (await post<{ token_id: string }>("auth.identify", { bearer: gateway.secret })).data;
     await post("agent.provision", { label: "cap-restoration/worker", actor: "cap-restoration" });
@@ -459,7 +463,12 @@ describe("local handoff authority and lifecycle", () => {
     await post("admin.execution_sweep", {}); // maintenance is separate from renewal
     expect((await post<{ status: string }>("get", { id: task.id })).data.status).toBe("todo");
     await post("admin.execution_sweep", { now: Date.now() + 121_000 });
-    expect((await post<{ status: string }>("get", { id: task.id })).data.status).toBe("blocked");
+    // Even a stale observation never re-parks: the scheduler holds dispatch,
+    // never the board — there is no capability park to restore or re-arm.
+    const stale = (await post<{ status: string; meta: { blocked?: unknown; execution_wait?: unknown } }>("get", { id: task.id })).data;
+    expect(stale.status).toBe("todo");
+    expect(stale.meta).not.toHaveProperty("blocked");
+    expect(stale.meta).not.toHaveProperty("execution_wait");
     expect((await post("update", { id: task.id, meta: { execution_requirements: { tier: "small", tools: [], environment: [] } } })).data.error).toMatch(/cannot silently weaken/);
     expect((await post("update", { id: task.id, meta_delete: ["execution_requirements"] })).data.error).toMatch(/cannot be deleted/);
   });
@@ -473,7 +482,10 @@ describe("local handoff authority and lifecycle", () => {
         actor: "test", type: "task", title: "Never started on a retired host", qualified: true,
         meta: { execution_requirements: { tier: "large", environment: ["retired-environment"] } },
       })).data;
-      expect(target.status).toBe("blocked");
+      // BR#23279: never-started work never parks blocked — todo with blockers;
+      // the batch disposition path accepts quiet todo work (same pen as the
+      // per-card path), so a recorded retirement still lands on it.
+      expect(target.status).toBe("todo");
       const subject = (await post<{ id: string }>("create", { actor: "test", type: "task", title: "Batch operator" })).data;
       const options = ["SUPERSEDE all 2", "KEEP both"];
       const ask = await post<{ id: string }>("ask.create", {
@@ -517,7 +529,12 @@ describe("durable executor on real SQLite", () => {
     expect(unprovisioned.data.phase).toBe("executor_not_ready");
     expect(unprovisioned.data.blockers).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "executor_not_ready", causes: expect.arrayContaining([expect.objectContaining({ readiness: expect.objectContaining({ kind: "unprovisioned" }) })]) })]));
     expect((await post("transition", { ...auth, to: "in_progress" })).data.error).toMatch(/worker|readiness/);
-    expect((await post("get", { id: task.id })).data.status).toBe("blocked"); // global policy exposes unavailable worker capacity
+    // BR#23279: readiness never blocks — the card stays claimable todo; the
+    // unavailable capacity rides meta.execution_blockers and the scheduler
+    // holds dispatch until the worker is provisioned.
+    const unavailable = (await post<{ status: string; meta: { execution_blockers?: { kind: string }[] } }>("get", { id: task.id })).data;
+    expect(unavailable.status).toBe("todo");
+    expect(unavailable.meta.execution_blockers ?? []).toEqual(expect.arrayContaining([expect.objectContaining({ kind: expect.stringMatching(/capability_unavailable|executor_not_ready/) })]));
     await post("agent.provision", { label: `${host}/worker`, actor: host });
     const ready = { ...capabilities, worker: { kind: "provisioned", label: `${host}/worker` } };
     expect((await cmd("ready", { kind: "advertise", capabilities: ready })).data.ok).toBe(true);
