@@ -744,6 +744,51 @@ the fence-scoped same-UID `/proc` census — and only the resulting
 outcome. Drifted fences (newer generation, non-stopping phase, handoff or
 prepared operations) are skipped, never acted on.
 
+**No hold class can languish (BR#23275 — the nothing-languishes invariant).**
+Every dispatch hold is a member of the closed `SchedulingReason` enum, and
+every member declares — in exactly one hand-written place — the WorkWait kind
+whose exit carries its release: `SCHEDULING_REASON_WAIT_PLAN` in
+`packages/contracts/src/work-wait.ts`, a `Record<SchedulingReason, …>` that is
+exhaustive by construction. The wait-graph builder (`boardWorkWaits`) derives
+its arms from that map instead of a parallel switch, so a held reason with no
+declared exit cannot compile, and a runtime reason outside the vocabulary
+raises a throttled `unknown_scheduling_reason` stop-the-line alarm instead of
+a silent skip. The census (`schedule_status`, `stats`) is typed end-to-end on
+the same enum. The contributor contract: **a new hold reason needs an enum
+member, a wait-plan entry, and a trigger that can fire with the fleet idle (or
+an age-bounded alarm naming the required actor) — or the build and tests
+break.** Each declared exit has one of three idle-safe wirings:
+
+- *Hub-derived* (`provider_route`, `startup_interrupt`, `host_affinity`,
+  `capability`, `recovery_route`, `startup_prerequisite`, and the
+  state-block reconciliation exits): recomputed from durable state on every
+  scheduler pass with no task running. `writer_reconciled` /
+  `operations_reconciled` come from the same execution state the hold itself
+  derives from — single source, so hold and exit cannot drift apart.
+- *Bounded time decay* (`retry_budget`): a budget hold fences RECENT
+  exhaustions, never a lifetime. After `EXECUTION_BUDGET_DECAY_MS` (6h) of
+  quiet — no fresh charge, no fresh attempt — the hold releases exactly ONE
+  fresh attempt; the fresh begin re-arms the quiet clock and a charged fresh
+  failure re-fences for a full window (at most one retry per window, no storm).
+  Permits and accepted-diagnosis stamps remain the primary, evidence-backed
+  exits; the quiet release is the starvation backstop.
+- *Sweep-routed* (`writer_not_quiescent`, `unknown_operations`): the attempt-
+  diagnosis sweep extends the existing recovery machinery to writers whose
+  lease, action deadline AND session signals all lapsed past the grace bound
+  (`dead_writer_grace_minutes`, default 30m) — the hub ROUTES a diagnosis
+  duty (never clears the slot itself); the duty verifies the writer is
+  actually gone first-hand on the host and only then attests quiesce for that
+  exact generation/attempt. A possibly-live writer keeps its own exit.
+
+Exits that need an external actor (human decisions, asks) are guarded by the
+all-class `dispatch_hold_pile` alarm: any class fires when its pile passes
+`dispatch_hold_pile_threshold` (default 8) or any card has been held past
+`dispatch_hold_stale_hours` (default 48) — one alarm per day naming every
+firing class with its oldest age and specimens. Invariant tests pin all three
+legs: the exhaustive map test (`contracts/test/work-wait.test.ts`), decay
+semantics (`contracts/test/execution.test.ts`), and the dead-writer routing
+drill (`worker/test/scheduling-hub.test.ts`).
+
 A verdict whose required hosted CI is still running parks durably instead of
 burning the slot (BR#18328): the live writer fences
 `{kind:"await_external", writers:"process_group_empty", wait:{type:"pr_required_checks", repo, pr, head_sha, contexts}}`

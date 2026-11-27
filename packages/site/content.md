@@ -445,7 +445,23 @@ minutes. A stale stopping attempt keeps
 its slot charged with a `stopping_writer_proof_pending` audit until the
 original host proves the writer absent — through a writer receipt, the
 original-worker stop proof or the fence-scoped same-UID `/proc` census — and
-only then do the normal `stopped`/`finalize` receipts free it. Repository
+only then do the normal `stopped`/`finalize` receipts free it.
+
+No hold class can languish (BR#23275): every dispatch hold reason is a member
+of one closed enum, and every member declares the board-wait exit that
+releases it in one typed map the wait graph derives from — a reason without a
+declared exit fails the build, and a runtime reason outside the vocabulary
+raises a stop-the-line alarm instead of a silent skip. Each declared exit has
+an idle-safe trigger: hub-derived holds recompute from durable state on every
+scheduler pass; a retry-budget hold decays after a 6-hour quiet window into
+exactly one fresh attempt (a charged fresh failure re-fences — at most one
+retry per window); and a writer whose lease, deadline and session signals all
+lapsed past the grace bound is routed by the diagnosis sweep to a recovery
+duty that verifies the writer is gone first-hand before attesting quiesce —
+the hub routes, it never clears a slot on a timer. Exits that need an external
+actor are guarded by the all-class hold-pile alarm, which fires on pile size
+or a 48-hour staleness bound naming every class with its oldest age.
+Repository
 refusals are task-scoped hub
 state, re-evaluated when prerequisite inputs change; a stale local give-up cache
 cannot override a released task. Repeated runtime failures use a visible bounded

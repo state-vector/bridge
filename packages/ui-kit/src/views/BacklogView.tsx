@@ -309,10 +309,13 @@ export function BacklogView({ openTask }: { openTask?: (id: string) => void } = 
                     {(r.waits as WorkWait[] | undefined)?.map(w => {
                       if (w.kind === "human_decision") return <span className="backlog-why" key={w.exit.ask_id}>Awaiting your answer to {w.exit.ask_id}</span>;
                       if (w.kind !== "prior_attempt_reconciliation") return null;
-                      const { writer_pending, operations, generation } = w.exit;
-                      return <span className="backlog-why" key={generation}>
-                        Attempt {generation}{writer_pending ? " · verify writer shutdown" : ""}
-                        {operations.length ? ` · reconcile ${operations.join(", ")}` : ""}
+                      const { event, generation } = w.exit;
+                      if (event === "writer_reconciled") return <span className="backlog-why" key={generation}>
+                        Attempt {generation} · verify writer shutdown
+                      </span>;
+                      const { operations } = w.exit;
+                      return <span className="backlog-why" key={`${generation}:${operations.length}`}>
+                        Attempt {generation}{operations.length ? ` · reconcile ${operations.join(", ")}` : ""}
                       </span>;
                     })}
                     {bs && (

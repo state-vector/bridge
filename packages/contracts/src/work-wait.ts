@@ -38,7 +38,42 @@ export type WorkWait =
       | { event: "reviewed_execution_repair"; task_id: string; duty_id?: string }
       | { event: "compatible_executor_ready"; task_id: string }
       | { event: "execution_admitted"; task_id: string; reason: ExecutionRecoveryReason } }
-  | { kind: "prior_attempt_reconciliation"; exit: {
-      event: "attempt_reconciled"; task_id: string; generation: number;
-      writer_pending: boolean; operations: string[];
-    } };
+  | { kind: "prior_attempt_reconciliation"; exit:
+      | { event: "writer_reconciled"; task_id: string; generation: number }
+      | { event: "operations_reconciled"; task_id: string; generation: number; operations: string[] } };
+
+/** BR#23275 — the machine-checked single vocabulary (Ray: a hold class
+ *  without an idle-safe exit "must be systematically impossible"): every
+ *  SchedulingReason declares, in exactly ONE hand-written place, the
+ *  WorkWait kind whose exit carries its release. Record<SchedulingReason, …>
+ *  is exhaustive by construction — a reason added to SchedulingReasonSchema
+ *  without an entry here FAILS TYPECHECK — and the wait-graph builder
+ *  (boardWorkWaits in the worker) derives its arms from this map instead of
+ *  a parallel hand-written switch, so a bare `break` (a reason with no
+ *  declared exit) is unrepresentable.
+ *
+ *  The two reconciliation classes route to prior_attempt_reconciliation,
+ *  whose exit is declared by the execution-state block in boardWorkWaits —
+ *  execution state is the single source of truth for both the hold and its
+ *  exit, so they cannot drift apart. */
+export type SchedulingReasonWaitPlan =
+  | { wait: "prerequisite"; reason: PrerequisiteReason }
+  | { wait: "execution_recovery"; reason: ExecutionRecoveryReason }
+  | { wait: "prior_attempt_reconciliation" };
+
+export const SCHEDULING_REASON_WAIT_PLAN: Record<SchedulingReason, SchedulingReasonWaitPlan> = {
+  qualification: { wait: "prerequisite", reason: "qualification" },
+  operator_gate: { wait: "prerequisite", reason: "operator_gate" },
+  question: { wait: "prerequisite", reason: "question" },
+  independent_wait: { wait: "prerequisite", reason: "independent_wait" },
+  lifecycle_gate: { wait: "prerequisite", reason: "lifecycle_gate" },
+  writer_not_quiescent: { wait: "prior_attempt_reconciliation" },
+  unknown_operations: { wait: "prior_attempt_reconciliation" },
+  retry_budget: { wait: "execution_recovery", reason: "retry_budget" },
+  provider_route: { wait: "execution_recovery", reason: "provider_route" },
+  recovery_route: { wait: "execution_recovery", reason: "recovery_route" },
+  host_affinity: { wait: "execution_recovery", reason: "host_affinity" },
+  capability: { wait: "execution_recovery", reason: "capability" },
+  startup_prerequisite: { wait: "execution_recovery", reason: "startup_prerequisite" },
+  startup_interrupt: { wait: "execution_recovery", reason: "startup_interrupt" },
+};

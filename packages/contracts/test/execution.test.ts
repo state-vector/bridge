@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ExecutionStateSchema, attemptDiagnosisCoversAttempt, executionNeedsRecoveryPermit, legacyTimeoutChargeGeneration, chargeExecutionFailure, executionAttemptBudgetExhausted, executionAdmissionHold, openLargerModelStrategy, providerRecoveryDiagnosis, validRecoveryRequestProof, recoveryPermitMatches, capabilityBlockers, initialExecution, reduceExecution, nextExecutorStartBarrier, recoverResourceStartBarrier, externalWaitCoveredBy, externalWaitHeadMoved, isReadOnlyCheckObservation, actionableMailbox, isAcpStartupInterrupt, startupInterruptBackoffMs, ACP_STARTUP_INTERRUPT_STDERR, type Checkpoint, type ExecutionCommand, type ExecutionMessage, type ExecutionState } from "../src/execution.ts";
+import { ExecutionStateSchema, attemptDiagnosisCoversAttempt, executionNeedsRecoveryPermit, legacyTimeoutChargeGeneration, chargeExecutionFailure, executionAttemptBudgetExhausted, executionAdmissionHold, openLargerModelStrategy, providerRecoveryDiagnosis, validRecoveryRequestProof, recoveryPermitMatches, capabilityBlockers, initialExecution, reduceExecution, nextExecutorStartBarrier, recoverResourceStartBarrier, externalWaitCoveredBy, externalWaitHeadMoved, isReadOnlyCheckObservation, actionableMailbox, isAcpStartupInterrupt, startupInterruptBackoffMs, ACP_STARTUP_INTERRUPT_STDERR, EXECUTION_BUDGET_DECAY_MS, lastExecutionActivity, type Checkpoint, type ExecutionCommand, type ExecutionMessage, type ExecutionState } from "../src/execution.ts";
 import { continueRecoveryLineage, reduceRecoveryEpisode, type RecoveryCause } from "../src/train-recovery.ts";
 
 const cp: Checkpoint = { repo: "https://github.com/state-vector/bridge.git", commit: "a".repeat(40), tree: "b".repeat(40), base: "c".repeat(40), environment: ["linux"], next: "Run failing integration test", tests: [] };
@@ -282,6 +282,67 @@ describe("durable execution failure boundaries", () => {
   });
 });
 
+describe("retry-budget quiet-window decay (BR#23275 — nothing languishes)", () => {
+  /** A stopped, budget-exhausted attempt with resolved operations and no
+   *  permit — the exact starvation shape the live board held 22 of. */
+  function fenced(exhaustedAt: number, beganAt = 100) {
+    const receipt = { ...fence, writers: "process_group_empty" as const, outcome: { kind: "failed" as const, exit_code: 1, stdout_tail: "", stderr_tail: "runner stopped" } };
+    let s = step(step(started(), { kind: "stopped", ...receipt }), { kind: "finalize", ...receipt }, 1_000);
+    s.attempt!.began_at = beganAt;
+    s.budget_exhaustions = 3;
+    s.budget_exhausted_at = exhaustedAt;
+    return s;
+  }
+  it("the quiet clock is the newest charge or attempt begin — either one keeps the fence armed", () => {
+    const s = fenced(1_000, 100);
+    expect(lastExecutionActivity(s)).toBe(1_000);
+    const laterBegin = fenced(100, 5_000);
+    expect(lastExecutionActivity(laterBegin)).toBe(5_000);
+  });
+  it("a legacy row with no recorded charge time cannot fence forever: quiet releases it", () => {
+    // The BR#8996 live specimen shape: budget_exhaustions 3 with
+    // budget_exhausted_at 0 and an attempt from days ago. Starvation, not
+    // pacing — the quiet release is the backstop.
+    const s = fenced(0);
+    expect(executionAttemptBudgetExhausted(s, "revision", 0)).toBe(false);
+    expect(executionAdmissionHold(s, "revision", 500)).toBeNull();
+  });
+  it("decay is hub-derived on the scheduler pass clock: no permit is minted, nothing is mutated", () => {
+    const s = fenced(1_000);
+    // Inside the window: fenced.
+    expect(executionAdmissionHold(s, "revision", 1_000 + EXECUTION_BUDGET_DECAY_MS - 1)).toBe("retry_budget");
+    expect(executionNeedsRecoveryPermit(s, "revision", 1_000 + EXECUTION_BUDGET_DECAY_MS - 1)).toBe(true);
+    // Past the window: released with the state untouched — the release is
+    // a predicate, the durable record still names its 3 exhaustions.
+    expect(executionAdmissionHold(s, "revision", 1_000 + EXECUTION_BUDGET_DECAY_MS)).toBeNull();
+    expect(executionNeedsRecoveryPermit(s, "revision", 1_000 + EXECUTION_BUDGET_DECAY_MS)).toBe(false);
+    expect(s.budget_exhaustions).toBe(3);
+    expect(s.recovery_permit).toBeNull();
+  });
+  it("the release is single-shot: a fresh attempt re-arms the clock, its charged failure re-fences", () => {
+    const s = fenced(1_000);
+    const releasedAt = 1_000 + EXECUTION_BUDGET_DECAY_MS;
+    const fresh = reduceExecution(s, { ...begin, attempt_id: "single-shot" }, "mac", "dispatch-BR-1", releasedAt, "revision");
+    expect(fresh.generation).toBe(2);
+    // The fresh attempt is its own activity: no second release until it
+    // goes quiet again.
+    expect(executionAdmissionHold(fresh, "revision", releasedAt + 1)).toBe("writer_not_quiescent");
+    const receipt2 = { generation: 2, attempt_id: "single-shot", writers: "process_group_empty" as const, outcome: { kind: "failed" as const, exit_code: 1, stdout_tail: "", stderr_tail: "failed again" } };
+    const stopped = step(step(fresh, { kind: "stopped", ...receipt2 }), { kind: "finalize", ...receipt2 }, releasedAt + 60);
+    chargeExecutionFailure(stopped, 2);
+    expect(stopped.budget_exhaustions).toBe(4);
+    expect(stopped.budget_exhausted_at).toBeGreaterThan(releasedAt);
+    expect(executionAdmissionHold(stopped, "revision", stopped.budget_exhausted_at + EXECUTION_BUDGET_DECAY_MS - 1)).toBe("retry_budget");
+    expect(executionAdmissionHold(stopped, "revision", stopped.budget_exhausted_at + EXECUTION_BUDGET_DECAY_MS)).toBeNull();
+  });
+  it("an accepted diagnosis still outranks the clock: coverage clears the hold at any age", () => {
+    const s = fenced(1_000);
+    const stamped = reduceExecution(s, { kind: "diagnosis_accepted", ...fence, hold: "retry_budget", duty: "BR#17814", accepted_by: "reviewer" }, "system:recovery", "", 2_000, "revision");
+    expect(attemptDiagnosisCoversAttempt(stamped)).toBe(true);
+    expect(executionAdmissionHold(stamped, "revision", 2_000 + EXECUTION_BUDGET_DECAY_MS - 1)).toBeNull();
+  });
+});
+
 describe("witnessed legacy recovery fences", () => {
   function held() {
     let s = step(started(), {kind:"quiesce",...fence,writers:"process_group_empty"});
@@ -297,12 +358,32 @@ describe("witnessed legacy recovery fences", () => {
     return s;
   }
   const capability = {backend:"opencode",model:"route",config_revision:"config"} as const;
-  it("does not authorize another begin just because a recorded exhaustion is old", () => {
+  it("BR#23275: a recent exhaustion still fences; a quiet window releases exactly one fresh begin, and a charged fresh failure re-fences", () => {
     const state = held();
     state.recovery_permit = null;
-    expect(executionAdmissionHold(state, "revision")).toBe("retry_budget");
-    expect(() => reduceExecution(state, { ...begin, attempt_id: "unchanged" }, "mac", "dispatch-BR-1",
-      3 * 86_400_000, "revision")).toThrow(/current recovery permit/);
+    // Inside the quiet window the budget hold is real pacing: no permit, no begin.
+    expect(executionAdmissionHold(state, "revision", 100 + EXECUTION_BUDGET_DECAY_MS - 1)).toBe("retry_budget");
+    expect(() => reduceExecution(state, { ...begin, attempt_id: "still-fenced" }, "mac", "dispatch-BR-1",
+      100 + EXECUTION_BUDGET_DECAY_MS - 1, "revision")).toThrow(/current recovery permit/);
+    // Beyond the window with no fresh charge and no fresh attempt, the hold
+    // is starvation, not pacing (Ray's nothing-languishes law): the quiet
+    // release admits ONE fresh begin with no permit at all.
+    const released = executionAdmissionHold(state, "revision", 100 + EXECUTION_BUDGET_DECAY_MS);
+    expect(released).toBeNull();
+    const fresh = reduceExecution(state, { ...begin, attempt_id: "fresh-after-quiet" }, "mac", "dispatch-BR-1",
+      100 + EXECUTION_BUDGET_DECAY_MS, "revision");
+    expect(fresh.generation).toBe(2);
+    expect(fresh.recovery_permit).toBeNull();
+    // The fresh begin re-arms the quiet clock — the release was single-shot.
+    expect(executionAdmissionHold(fresh, "revision", 100 + EXECUTION_BUDGET_DECAY_MS + 1)).toBe("writer_not_quiescent");
+    // A charged failure of the fresh attempt re-fences for a full window.
+    const charged = structuredClone(fresh);
+    const freshReceipt = { generation: 2, attempt_id: "fresh-after-quiet", writers: "process_group_empty" as const, outcome: { kind: "failed" as const, exit_code: 1, stdout_tail: "", stderr_tail: "failed again" } };
+    const stoppedFresh = step(step(charged, { kind: "stopped", ...freshReceipt }), { kind: "finalize", ...freshReceipt }, 100 + EXECUTION_BUDGET_DECAY_MS + 60);
+    chargeExecutionFailure(stoppedFresh, 2);
+    expect(stoppedFresh.budget_exhaustions).toBe(4);
+    expect(executionAdmissionHold(stoppedFresh, "revision", stoppedFresh.budget_exhausted_at + 1)).toBe("retry_budget");
+    expect(executionAdmissionHold(stoppedFresh, "revision", stoppedFresh.budget_exhausted_at + EXECUTION_BUDGET_DECAY_MS)).toBeNull();
   });
   it("accepts a configured proxy receipt only for route recovery, with the observed request ceiling", () => {
     const proof = held().recovery_permit!.proof;
@@ -402,12 +483,12 @@ describe("cause-preserving strategy attempts", () => {
       stderr_tail: "acp session/prompt failed: Internal error: No deployments available for selected model, Try again in 30 seconds. Passed model=test/small. pre-call-checks=False, cooldown_list=[]" } as const;
     const receipt = { ...fence, writers: "process_group_empty", outcome } as const;
     const state = step(step(started(), { kind: "stopped", ...receipt }), { kind: "finalize", ...receipt });
-    expect(executionAdmissionHold(state, "reviewed")).toBe("provider_route");
+    expect(executionAdmissionHold(state, "reviewed", 200)).toBe("provider_route");
     openLargerModelStrategy(state, "medium", "Reviewed different model", "independent_review", "reviewed");
     const resume = { ...begin, attempt_id: "different-strategy" };
-    expect(executionAdmissionHold(state, "edited")).toBe("provider_route");
+    expect(executionAdmissionHold(state, "edited", 200)).toBe("provider_route");
     expect(() => reduceExecution(state, resume, "mac", "dispatch-BR-1", 200, "edited")).toThrow(/provider route/);
-    expect(executionAdmissionHold(state, "reviewed")).toBeNull();
+    expect(executionAdmissionHold(state, "reviewed", 200)).toBeNull();
     expect(reduceExecution(state, resume, "mac", "dispatch-BR-1", 200, "reviewed").generation).toBe(2);
   });
   it("admits a genuinely larger strategy with preserved history and bounded new failures", () => {
@@ -415,8 +496,8 @@ describe("cause-preserving strategy attempts", () => {
     openLargerModelStrategy(s,"medium","The current model cannot resolve the cross-system invariant","independent_review","revision");
     s.requirements.tier="medium";
     expect(s.budget_exhaustions).toBe(3);
-    expect(executionAttemptBudgetExhausted(s,"revision")).toBe(false);
-    expect(executionAttemptBudgetExhausted(s,"changed")).toBe(true);
+    expect(executionAttemptBudgetExhausted(s,"revision",200)).toBe(false);
+    expect(executionAttemptBudgetExhausted(s,"changed",200)).toBe(true);
     chargeExecutionFailure(s,1); // late old-strategy result must not spend new-strategy attempts
     expect(s.retry_strategy?.failures).toBe(0);
     for (const generation of [2,3,4]) chargeExecutionFailure(s,generation);
@@ -464,7 +545,7 @@ describe("accepted recovery diagnosis stamps (BR#18198)", () => {
 
   it("stamps the accepted reconciliation and clears the retry_budget hold for the covered attempt", () => {
     const s = exhausted();
-    expect(executionAdmissionHold(s, "revision")).toBe("retry_budget");
+    expect(executionAdmissionHold(s, "revision", 2_000)).toBe("retry_budget");
     expect(attemptDiagnosisCoversAttempt(s)).toBe(false);
     const next = reduceExecution(s, stamp, "system:recovery", "", 2_000, "revision");
     expect(next.attempt_diagnosis).toMatchObject({ generation: 1, attempt_id: "one", hold: "retry_budget", duty: "BR#17814" });
@@ -480,7 +561,7 @@ describe("accepted recovery diagnosis stamps (BR#18198)", () => {
   });
   it("keeps the fencing hold when the stamp is missing or the attempt moved on", () => {
     const unstamped = exhausted();
-    expect(executionAdmissionHold(unstamped, "revision")).toBe("retry_budget");
+    expect(executionAdmissionHold(unstamped, "revision", 2_000)).toBe("retry_budget");
     // A newer generation invalidates the stamp: coverage follows the attempt.
     let moved = reduceExecution(unstamped, stamp, "system:recovery", "", 2_000, "revision");
     moved = step(moved, { ...begin, attempt_id: "next" }, 3_000);
@@ -490,7 +571,7 @@ describe("accepted recovery diagnosis stamps (BR#18198)", () => {
     expect(attemptDiagnosisCoversAttempt(moved)).toBe(false);
     moved.budget_exhaustions = 4;
     moved.budget_exhausted_at = 4_000;
-    expect(executionAdmissionHold(moved, "revision")).toBe("retry_budget");
+    expect(executionAdmissionHold(moved, "revision", 4_500)).toBe("retry_budget");
   });
   it("refuses every session command and stamps only from the hub's internal write", () => {
     const running = started();

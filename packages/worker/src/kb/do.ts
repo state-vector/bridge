@@ -13,7 +13,7 @@ import { DUTY_LOOKUP_SCHEMA, backfillDutyLookup } from "./duty-lookup";
  * Transport: the worker forwards JSON op requests via fetch("https://kb/<op>").
  * Ops: create | get | list | search | update | transition | link | stats
  */
-import { WorkerStatusSchema, trainCandidateActivity, type WorkWait } from "@bridge/contracts";
+import { WorkerStatusSchema, trainCandidateActivity, SCHEDULING_REASON_WAIT_PLAN, type WorkWait, type SchedulingReasonWaitPlan } from "@bridge/contracts";
 import { SchemaInitialization } from "./schema-init.ts";
 import type { DeliveryAdmission, DeliveryDisposition, AcceptedPrLeg } from "@bridge/contracts";
 import {
@@ -3872,6 +3872,18 @@ export class KnowledgeHub {
     }
   }
 
+  /** BR#23275 — the runtime stop-the-line for vocabulary drift: a held
+   *  reason outside SchedulingReason has bypassed the typed pipeline (e.g.
+   *  a string-built reason in persisted JSON). One throttled typed alarm
+   *  naming it — never a silent skip: a skipped reason is an undeclared
+   *  exit, the exact defect class this invariant exists to make impossible. */
+  private unknownSchedulingReason(reason: string, taskId: string) {
+    if (this.one(`SELECT seq FROM ledger WHERE kind='signal' AND action='unknown_scheduling_reason' AND json_extract(data,'$.reason')=? AND ts>? LIMIT 1`, reason, Date.now() - 900_000)) return;
+    this.audit("system:scheduler", "unknown_scheduling_reason", taskId, {
+      reason, note: "held reason outside SchedulingReason — wire it in SCHEDULING_REASON_WAIT_PLAN or fix the emitting path",
+    });
+  }
+
   private boardWorkWaits(
     task: { id: string; status: string; meta: { blocked?: { await_event?: unknown; repairing?: { duty: string; original: unknown } }; startup_wait?: unknown }; gateway_dispatch?: GatewayDispatch },
     state: ExecutionState | undefined,
@@ -3905,23 +3917,47 @@ export class KnowledgeHub {
       waits.push({ kind: "prerequisite", exit: { event: "train_advanced", task_id: id, phase } });
     }
     if (state) {
+      // BR#23275 — the wait-graph interface for the writer/operations hold
+      // classes: one class-named exit per durable fact, derived from the
+      // same execution state the dispatch hold derives from (single source).
+      // writer_reconciled names the originating runner's quiesce/finalize
+      // attestation (or a diagnosis duty's first-hand verify); a provably
+      // dead writer is ROUTED to one by the diagnosis sweep — see
+      // scheduleAttemptDiagnosis. operations_reconciled names the
+      // reconcile_operation receipt that settles each unknown effect.
       const writerPending = !!state.attempt && state.attempt.phase !== "quiesced";
       const operations = state.operations.filter(op => op.state === "prepared" || op.state === "outcome_unknown").map(op => op.id);
-      if (writerPending || operations.length) waits.push({ kind: "prior_attempt_reconciliation",
-        exit: { event: "attempt_reconciled", task_id: id, generation: state.generation, writer_pending: writerPending, operations } });
+      if (writerPending) waits.push({ kind: "prior_attempt_reconciliation",
+        exit: { event: "writer_reconciled", task_id: id, generation: state.generation } });
+      if (operations.length) waits.push({ kind: "prior_attempt_reconciliation",
+        exit: { event: "operations_reconciled", task_id: id, generation: state.generation, operations } });
     }
     if (dispatch?.kind === "held") for (const reason of dispatch.reasons) {
-      switch (reason) {
-        case "writer_not_quiescent": case "unknown_operations": break;
-        case "provider_route": case "retry_budget": case "recovery_route": case "host_affinity": case "capability": case "startup_prerequisite": case "startup_interrupt":
-          waits.push({ kind: "execution_recovery", exit: { event: "execution_admitted", task_id: id, reason } });
-          break;
-        case "independent_wait":
-          if (awaited || openAsks.length) break;
-          // fall through for a separate lifecycle or review gate
-        case "qualification": case "operator_gate": case "question": case "lifecycle_gate":
-          waits.push({ kind: "prerequisite", exit: { event: "admission_satisfied", task_id: id, reason } });
+      // BR#23275 — the arm list is DERIVED from the contracts map: the plan
+      // record is the single hand-written mapping (Record<SchedulingReason,…>
+      // is exhaustive by construction — a reason without a plan fails
+      // typecheck in contracts), so a held reason can never reach this loop
+      // without a declared exit kind, and a bare `break` cannot reappear.
+      // The lookup is typed, but persisted JSON can bypass types: an unknown
+      // reason raises the typed stop-the-line alarm, never a silent skip.
+      const plan: SchedulingReasonWaitPlan | undefined = SCHEDULING_REASON_WAIT_PLAN[reason];
+      if (!plan) { this.unknownSchedulingReason(reason, id); continue; }
+      if (plan.wait === "prior_attempt_reconciliation") {
+        // The state block above is the exit source for these two classes —
+        // the same durable execution state the hold derives from (single
+        // source of truth): writer_reconciled / operations_reconciled are
+        // already declared there; pushing another wait here would duplicate
+        // them and drift.
+        continue;
       }
+      if (plan.wait === "execution_recovery") {
+        waits.push({ kind: "execution_recovery", exit: { event: "execution_admitted", task_id: id, reason: plan.reason } });
+        continue;
+      }
+      // prerequisite: the awaited/ask wait already declares an independent
+      // wait's release; only a separate lifecycle or review gate adds one.
+      if (plan.reason === "independent_wait" && (awaited || openAsks.length)) continue;
+      waits.push({ kind: "prerequisite", exit: { event: "admission_satisfied", task_id: id, reason: plan.reason } });
     }
     return waits;
   }
@@ -21069,6 +21105,29 @@ export class KnowledgeHub {
    * one fence a receipt can actually settle. The status stays parked; the
    * assigned diagnostic settles the original ledger entry and the ordinary
    * continuation consumes the wait. */
+  /** BR#23275 — is an unquiesced attempt's writer PROVABLY dead? Every
+   *  durable clock the hub owns must say so: the execution lease AND the
+   *  action deadline both lapsed past the grace bound, and the attempt's
+   *  session shows no ping in that window. Deadlines alone never discharge
+   *  a slot (the reverted expiry-relabel lesson) — this predicate only
+   *  ROUTES a diagnosis duty; the durable exit remains the originating
+   *  host's quiesce/finalize attestation, which the duty verifies
+   *  first-hand before sending. Crash/restart safe: derived entirely from
+   *  persisted state on each sweep pass, never from in-memory clocks. */
+  private provablyDeadWriter(state: ExecutionState, now: number): boolean {
+    const attempt = state.attempt;
+    if (!attempt || attempt.phase === "quiesced") return false;
+    const graceMs = Math.max(5, Math.min(1440, parseInt(this.settingValue("dead_writer_grace_minutes", "30"), 10) || 30)) * 60_000;
+    const lastHardClock = Math.max(Number(attempt.lease_until ?? 0), Number(attempt.action_deadline ?? 0));
+    if (!lastHardClock || now - lastHardClock < graceMs) return false;
+    // A live dispatched writer renews its lease by polling and pings the hub
+    // (BR#4067); either signal inside the grace window keeps its own exit.
+    const ping = this.one(STALL_SESSION_PINGS_SQL, String(attempt.session ?? ""));
+    const sessionSignal = Math.max(Number(ping?.seen ?? 0), Number(ping?.worker_seen ?? 0));
+    if (sessionSignal > 0 && now - sessionSignal < graceMs) return false;
+    return true;
+  }
+
   private async scheduleAttemptDiagnosis(): Promise<void> {
     const candidates = this.state.storage.sql.exec(`
       SELECT a.id,a.created_ts,a.meta,a.status AS subject_status,a.owner AS subject_owner,a.tags,a.roles,e.state,duty.status AS diagnosis_status,
@@ -21085,7 +21144,12 @@ export class KnowledgeHub {
         AND (json_extract(e.state,'$.budget_exhaustions') > 0
           OR json_extract(e.state,'$.retry_strategy') IS NOT NULL
           OR EXISTS (SELECT 1 FROM json_each(e.state,'$.operations') op
-            WHERE json_extract(op.value,'$.state') IN ('prepared','outcome_unknown')))
+            WHERE json_extract(op.value,'$.state') IN ('prepared','outcome_unknown'))
+          -- BR#23275 — an UNQUIESCED attempt joins the candidate set; the
+          -- row loop's provablyDeadWriter gate decides whether its writer is
+          -- dead beyond the grace bound (a live writer keeps its own exit).
+          OR (json_extract(e.state,'$.attempt.phase') IS NOT NULL
+            AND json_extract(e.state,'$.attempt.phase') != 'quiesced'))
       ORDER BY a.created_ts, a.id`).toArray();
     const rows = new Map(candidates.map(row => [String(row.id), row]));
     // Stable sort over the age-ordered fetch: the shared law decides, age and
@@ -21110,7 +21174,15 @@ export class KnowledgeHub {
         const parked = String(row.subject_status) === "blocked";
         if (parked && (hold !== "unknown_operations"
           || !this.reconcilableBlockedWait(id, { status: "blocked", owner: String(row.subject_owner ?? "") }, meta, state, Date.now()))) continue;
-        if (hold !== "retry_budget" && hold !== "unknown_operations") continue;
+        // BR#23275 — writer_not_quiescent enters ONLY through the provably-
+        // dead-writer gate: lease AND action deadline lapsed past the grace
+        // bound with no session signal in that window. A live writer keeps
+        // its own exit (the originating runner's attestation); a dead one
+        // would otherwise languish forever — nothing else can ever unblock
+        // it. The sweep ROUTES a diagnosis duty; it never clears anything
+        // itself (the reverted expiry-relabel lesson at BR#14703).
+        if (hold !== "retry_budget" && hold !== "unknown_operations"
+          && !(hold === "writer_not_quiescent" && this.provablyDeadWriter(state, Date.now()))) continue;
         if (hold === "retry_budget" && state.recovery_permit?.task_revision === revision && recoveryPermitCoversAttempt(state, Date.now())) continue;
         // BR-flow-unblock — the guard skips used to be SILENT: a budget- or
         // operations-fenced card whose diagnosis was blocked by a guard just
@@ -21144,7 +21216,13 @@ export class KnowledgeHub {
         if (diagnosedSameAttempt && String(row.diagnosis_status) === "done") {
           const dutyId = String(meta.execution_diagnosis.duty ?? "");
           const review = this.currentTaskReview(dutyId);
-          if (review.phase === "accepted" && review.result.kind === "accepted_execution"
+          // BR#23275 — a diagnosis stamp only exists for the two stampable
+          // holds; a writer_not_quiescent duty's durable record IS the
+          // runner's quiesce/finalize attestation, so a closed duty with no
+          // attestation is genuinely unreconciled: the re-arm below routes
+          // a fresh duty.
+          if ((hold === "retry_budget" || hold === "unknown_operations")
+            && review.phase === "accepted" && review.result.kind === "accepted_execution"
             && this.acceptAttemptDiagnosis(id, state, hold, dutyId, "system:recovery")) {
             this.diagnosisAcceptedSkip(id, state);
             continue;
@@ -21246,7 +21324,7 @@ export class KnowledgeHub {
 
 This is Bridge-owned repair work. Do not ask the human to investigate queue metadata, assign another agent, or authorise a mechanical rebase.
 
-Read the affected task and its current claim first. If another executor is actively repairing it, coordinate with that executor and do not change its claim. Inspect its actual prerequisites, linked questions and recorded answers before repeating a decision. For a missing resume condition, restore the precise typed event from evidence; an answered ask is not proof that the chosen operation ran. Preserve existing human scope and authority: this duty cannot authorise retirement or invent permission. For an exhausted execution budget, inspect the durable attempt and distinguish provider, environment, and strategy failure. Obtain a valid recovery permit or independently reviewed strategy before resuming; a cleared counter, timer, or completed diagnostic alone cannot authorize retry. For unknown operations, inspect the external system by operation identity. Read-only probes do not use the external mutation ledger. Record a conclusive result with execution reconcile_operation on the subject using the stopped attempt generation and attempt_id, the operation_id and input_revision, and first-hand receipts. If the evidence is inconclusive, preserve the hold. Never repeat the operation to find out whether it succeeded. If the task has a PR, inspect GitHub: failing checks, conflicts, current head, review coverage, and whether it already merged. Repair only the demonstrated defect, obtain independent review where needed, and restore valid delivery tracking. A prerequisite merge resumes work; it never proves that post-deploy actions ran.
+Read the affected task and its current claim first. If another executor is actively repairing it, coordinate with that executor and do not change its claim. Inspect its actual prerequisites, linked questions and recorded answers before repeating a decision. For a missing resume condition, restore the precise typed event from evidence; an answered ask is not proof that the chosen operation ran. Preserve existing human scope and authority: this duty cannot authorise retirement or invent permission. For an exhausted execution budget, inspect the durable attempt and distinguish provider, environment, and strategy failure. Obtain a valid recovery permit or independently reviewed strategy before resuming; a cleared counter, timer, or completed diagnostic alone cannot authorize retry. For unknown operations, inspect the external system by operation identity. Read-only probes do not use the external mutation ledger. Record a conclusive result with execution reconcile_operation on the subject using the stopped attempt generation and attempt_id, the operation_id and input_revision, and first-hand receipts. If the evidence is inconclusive, preserve the hold. Never repeat the operation to find out whether it succeeded. For an unquiesced attempt the hub routed as a provably dead writer — execution state shows an attempt whose lease, action deadline and session signals all lapsed past the grace bound — verify first-hand on this gateway that the attempt's writer is actually gone: no live process from its session, its worktree idle. Only then attest execution quiesce for that exact generation and attempt_id with the process-group-empty proof you verified yourself. If any writer process survives, or the evidence is inconclusive, never attest — record the observation and preserve the hold. When the attempt already carries captured terminal evidence (stopped, phase finalizing), that evidence is immutable: finalize must replay it exactly, never rewrite it. If the task has a PR, inspect GitHub: failing checks, conflicts, current head, review coverage, and whether it already merged. Repair only the demonstrated defect, obtain independent review where needed, and restore valid delivery tracking. A prerequisite merge resumes work; it never proves that post-deploy actions ran.
 
 When the affected task is waiting on this recovery duty, submit a replacement condition on transition to in_review with unblock_result {kind:"reblocked",parent_id:"${taskId}",reason,next,await_event}. The independent reviewer verifies that the replacement is causal and observable. If no replacement is feasible, obtain a receipt-backed disposition. Completion alone will not release the task.
 

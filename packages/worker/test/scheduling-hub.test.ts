@@ -1,7 +1,7 @@
 import { Miniflare } from "miniflare";
 import { readFileSync, realpathSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { SchedulingOutcomeSchema } from "@bridge/contracts";
+import { SchedulingOutcomeSchema, SchedulingReasonSchema } from "@bridge/contracts";
 import { executorRequest } from "./executor-fixture";
 
 let mf: Miniflare;
@@ -42,6 +42,24 @@ beforeEach(async () => {
         if (path === "/fixture/attempt-diagnosis") {
           await this.scheduleAttemptDiagnosis();
           return Response.json({ok:true});
+        }
+        if (path === "/fixture/dead-writer") {
+          // BR#23275 — stamp an unquiesced attempt whose every durable clock
+          // (lease, action deadline, began) lapsed age_ms ago, exactly the
+          // shape the hub's dead-writer gate must classify. No session ping
+          // exists, so the session signal is silent by construction.
+          const { id, age_ms = 31 * 60_000 } = await request.json();
+          const now = Date.now();
+          const row = this.state.storage.sql.exec("SELECT state FROM execution_state WHERE task_id=?", id).toArray()[0];
+          const state = row ? JSON.parse(row.state) : { policy_version: 1, revision: 0, generation: 0, attempt: null, requirements: {}, messages: [], operations: [] };
+          state.generation = Math.max(1, Number(state.generation ?? 0));
+          state.attempt = { generation: state.generation, attempt_id: "dead-writer", phase: "stopping",
+            host: "mac", session: "dead-writer-session", lease_until: now - age_ms, action_deadline: now - age_ms,
+            checkpoint: null, restored_tree: null, began_at: now - age_ms };
+          state.budget_exhaustions = 0;
+          state.budget_exhausted_at = 0;
+          this.state.storage.sql.exec("INSERT INTO execution_state (task_id, state, worker_token_id) VALUES (?, ?, '') ON CONFLICT(task_id) DO UPDATE SET state=excluded.state", id, JSON.stringify(state));
+          return Response.json({ ok: true });
         }
         if (path === "/fixture/bypass-budget") {
           const { id } = await request.json();
@@ -1349,7 +1367,10 @@ describe("eligibility-first scheduling on real SQLite", () => {
   it("recovers a stranded diagnosis after the old cooldown without retrying the unchanged work", async () => {
     const project = "aged-diagnosis", g = await gateway(project);
     const id = await task(project);
-    expect(await post("fixture/budget-pile", { ids: [id], age_ms: 3 * 86_400_000 })).toEqual({ ok: true, stamped: 1 });
+    // BR#23275 — the decay window (6h) bounds how old a budget hold can be
+    // and still fence: aging 3 days now RELEASES (the starvation backstop),
+    // so this scenario pins inside the window where the hold is real.
+    expect(await post("fixture/budget-pile", { ids: [id], age_ms: 60_000 })).toEqual({ ok: true, stamped: 1 });
     expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { retry_budget: 1 } });
     await post("fixture/attempt-diagnosis", {});
     const original = (await post("get", { id })).meta.execution_diagnosis;
@@ -1377,6 +1398,50 @@ describe("eligibility-first scheduling on real SQLite", () => {
       await_event: { event: "br_done", id: repair } })).status).toBe("blocked");
     expect((await post("transition", submission)).status).toBe("in_review");
     expect((await post("get", { id })).meta.blocked.await_event).toEqual({ event: "br_done", id: repair });
+  });
+  it("releases exactly one fresh attempt after the retry-budget quiet window (BR#23275)", async () => {
+    const project = "budget-decay", g = await gateway(project);
+    const id = await task(project);
+    // Three exhaustions recorded three DAYS ago with no attempt since: the
+    // hold is starvation, not pacing — the decay window releases it and the
+    // hub reserves the subject with no recovery permit anywhere.
+    expect(await post("fixture/budget-pile", { ids: [id], age_ms: 3 * 86_400_000 })).toEqual({ ok: true, stamped: 1 });
+    const reservation = await reserve(g);
+    if (reservation.kind !== "reserved" || reservation.task_id !== id) throw new Error(JSON.stringify(reservation));
+    // The fresh attempt is admissible on the runner side too: begin mints a
+    // generation without demanding a permit the quiet window already granted.
+    expect((await g.cmd({ kind: "begin", attempt_id: "fresh-after-quiet", worker: g.auth.agent, action_budget_ms: 60_000 },
+      undefined, id, reservation.session)).error).toBeUndefined();
+  });
+  it("routes a provably dead writer to a diagnosis duty while a live writer keeps its own exit (BR#23275)", async () => {
+    const project = "dead-writer", g = await gateway(project);
+    const id = await task(project);
+    // LIVE writer: lease and action deadline only 5m stale — inside the grace
+    // bound. The hub holds the card but never sweeps it: the originating
+    // runner's own quiesce/finalize attestation stays the only exit.
+    await post("fixture/dead-writer", { id, age_ms: 5 * 60_000 });
+    expect(await reserve(g)).toMatchObject({ kind: "no_eligible_work", reasons: { writer_not_quiescent: 1 } });
+    await post("fixture/attempt-diagnosis", {});
+    expect((await post("get", { id })).meta.execution_diagnosis).toBeUndefined();
+    // The census leg of the single vocabulary: every emitted hold key is an
+    // enum member — no ad-hoc reason strings anywhere in the pipeline.
+    const status = await g.cmd({ kind: "schedule_status", refresh: true, host: g.host });
+    const vocabulary = new Set<string>(SchedulingReasonSchema.options);
+    for (const host of status.hosts ?? []) {
+      for (const key of [...Object.keys(host.reasons ?? {}), ...Object.keys(host.held ?? {})]) {
+        expect(vocabulary.has(key), `census emitted non-SchedulingReason hold key: ${key}`).toBe(true);
+      }
+    }
+    // DEAD writer: every durable clock lapsed past the grace bound. The sweep
+    // ROUTES a diagnosis duty through the existing recovery machinery — it
+    // never clears the slot itself — and that duty becomes the claimable work.
+    await post("fixture/dead-writer", { id, age_ms: 31 * 60_000 });
+    await post("fixture/attempt-diagnosis", {});
+    const stamp = (await post("get", { id })).meta.execution_diagnosis;
+    expect(stamp).toMatchObject({ hold: "writer_not_quiescent" });
+    expect(stamp.duty).toBeTruthy();
+    const reservation = await reserve(g);
+    if (reservation.kind !== "reserved" || reservation.task_id !== stamp.duty) throw new Error(JSON.stringify(reservation));
   });
   it("lets a gateway-runner diagnostic exit through the board-side continuation its refusal names (BR#17881)", async () => {
     const project = "diagnosis-board-continuation", g = await gateway(project);

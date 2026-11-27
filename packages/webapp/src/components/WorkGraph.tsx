@@ -34,7 +34,8 @@ function describe(exit: Exit): [string, string?] {
     case "startup_ready": return [`${exit.previous.host} ready: ${exit.previous.reason}`];
     case "compatible_executor_ready": return ["Compatible executor ready"];
     case "admission_satisfied": case "execution_admitted": return [words(exit.reason)];
-    case "attempt_reconciled": return [[`Attempt ${exit.generation} reconciled`, exit.writer_pending && "writer stopped",
+    case "writer_reconciled": return [`Attempt ${exit.generation} writer reconciled`];
+    case "operations_reconciled": return [[`Attempt ${exit.generation} operations reconciled`,
       exit.operations.length && exit.operations.join(", ")].filter(Boolean).join(" · ")];
   }
 }
@@ -44,7 +45,7 @@ function conditionKind(exit: Exit): "time" | "system" | "event" {
     case "time": return "time";
     case "lane_health": case "run_success": case "pr_checks_green": case "deployed":
     case "startup_ready": case "compatible_executor_ready": case "execution_admitted":
-    case "admission_satisfied": case "attempt_reconciled": return "system";
+    case "admission_satisfied": case "writer_reconciled": case "operations_reconciled": return "system";
     default: return "event";
   }
 }

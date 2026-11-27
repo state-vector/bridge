@@ -6,6 +6,17 @@ import { ExecutorNotReadySchema } from "./executor-readiness.ts";
 export const EXECUTION_POLICY_VERSION = 1;
 export const EXECUTOR_READINESS_PROTOCOL = "worker-ready-v2";
 export const EXECUTION_LEASE_MS = 120_000;
+/** BR#23275 — the retry-budget quiet window (Ray's nothing-languishes law:
+ * "retry_budget should not permanently starve"). A budget hold fences
+ * RECENT exhaustions, never a lifetime: after this much quiet — no fresh
+ * charge, no fresh attempt — the hold releases exactly ONE fresh attempt.
+ * A charged fresh failure re-stamps the clock and re-fences for a full
+ * window, so decay can never become a retry storm: a permanently failing
+ * task retries at most once per window. This supersedes BR#17396's "age is
+ * never a permit" for the starvation tail only — permit and accepted-
+ * diagnosis dispositions remain the primary, evidence-backed exits; the
+ * quiet release is the bounded backstop a dead fleet cannot starve on. */
+export const EXECUTION_BUDGET_DECAY_MS = 6 * 3_600_000;
 const text = z.string().min(1).max(4000);
 const sha = z.string().regex(/^[a-f0-9]{40,64}$/);
 export const ReasoningTierSchema = z.enum(["small", "medium", "large"]);
@@ -724,7 +735,7 @@ export function reduceExecution(previous: ExecutionState, command: ExecutionComm
       return s;
     }
     case "begin": {
-      const needsRecoveryPermit = executionNeedsRecoveryPermit(s, taskRevision);
+      const needsRecoveryPermit = executionNeedsRecoveryPermit(s, taskRevision, now);
       if (!["none", "returned"].includes(s.handoff.phase)) throw new Error("gate: local handoff owns execution; autonomous dispatch is forbidden");
       if (needsRecoveryPermit && !(s.recovery_permit?.task_revision === taskRevision && recoveryPermitCoversAttempt(s, now))) throw new Error("gate: retry budget or provider route requires a current recovery permit");
       if (a && a.phase !== "quiesced") throw new Error("gate: previous writer requires quiescence acknowledgement; retain host affinity");
@@ -1028,12 +1039,26 @@ export function recoveryPermitMatches(state: ExecutionState, capability: Pick<Ex
 
 /** Cumulative history is immutable; admission is bounded within an explicit
  * changed strategy. Time, aliases, sessions and arbitrary edits grant nothing. */
-export function executionAttemptBudgetExhausted(state: ExecutionState, taskRevision = "legacy"): boolean {
+export function executionAttemptBudgetExhausted(state: ExecutionState, taskRevision = "legacy", now = Date.now()): boolean {
+  // BR#23275 — the quiet-window backstop first: a hold whose last durable
+  // activity (charge or attempt begin) is older than the decay window is
+  // starvation, not pacing. Releasing here admits exactly one fresh attempt
+  // — its begin re-arms the clock, and a charged failure re-fences.
+  if (now - lastExecutionActivity(state) >= EXECUTION_BUDGET_DECAY_MS) return false;
   const strategy = state.retry_strategy;
   // Retain the legacy exception for imported counters with no recorded charge.
   // An actual exhaustion needs a recovery disposition; age is never a permit.
   if (!strategy) return state.budget_exhaustions >= 3 && state.budget_exhausted_at > 0;
   return strategy.task_revision !== taskRevision || strategy.failures >= 3;
+}
+
+/** BR#23275 — the hub-derived quiet clock: the newest durable proof of
+ *  attempt activity. A fresh charge (budget_exhausted_at) and a fresh
+ *  attempt (began_at) both count as activity; the absence of both IS the
+ *  quiet the decay window measures. Derived from ledger fields the hub
+ *  already stamps on every scheduler pass — no new writer, no new thread. */
+export function lastExecutionActivity(state: ExecutionState): number {
+  return Math.max(state.budget_exhausted_at ?? 0, state.attempt?.began_at ?? 0);
 }
 export function openLargerModelStrategy(state: ExecutionState, tier: ReasoningTier, reason: string,
   source: "executor" | "independent_review", taskRevision: string): void {
@@ -1044,8 +1069,8 @@ export function openLargerModelStrategy(state: ExecutionState, tier: ReasoningTi
   state.retry_strategy = {kind:"larger_model",epoch:(state.retry_strategy?.epoch ?? 0)+1,task_revision:taskRevision,
     minimum_tier:tier,first_generation:state.generation+1,failures:0,reason,source};
 }
-export function executionNeedsRecoveryPermit(state: ExecutionState, revision: string): boolean {
-  const hold = executionAdmissionHold(state, revision);
+export function executionNeedsRecoveryPermit(state: ExecutionState, revision: string, now = Date.now()): boolean {
+  const hold = executionAdmissionHold(state, revision, now);
   return hold === "provider_route" || hold === "retry_budget";
 }
 
@@ -1071,7 +1096,7 @@ export function executionAdmissionHold(state: ExecutionState | undefined, revisi
   if (attempt && terminal && terminalMatches
     && !(state.retry_strategy?.task_revision === revision && attempt.generation < state.retry_strategy.first_generation)
     && providerRecoveryDiagnosis(terminal.outcome) === "provider_route_unavailable") return "provider_route";
-  if (executionAttemptBudgetExhausted(state, revision)) {
+  if (executionAttemptBudgetExhausted(state, revision, now)) {
     // BR#18198 — a durable accepted diagnosis of THIS stopped attempt clears
     // the budget hold: the scheduler's own reservation is the admissible
     // retry, and re-fencing the same attempt loops recovery duties forever
