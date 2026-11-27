@@ -38,6 +38,13 @@ Health readiness and controller quiescence are separate facts: a busy healthy
 controller can pass startup verification while job-specific waits stay protected.
 Stopping it for rollback still requires its real handoff acknowledgement. A newer
 supervisor bootstrap cannot be downgraded by an older native build's embedded code.
+Restarting the supervisor or re-entering a wait reconciles the journal against the
+running controller and live health: a rollback journal whose target is already
+running and healthy is finalized as confirmed, never resumed. An admission hold
+never outlives its operation deadline — a transport wait still open past it aborts
+the operation, releases the hold and raises a stop-the-line ops alarm naming the
+blocking cause (a rollback blocked on a non-idle candidate: dead writers cannot
+report themselves dead). The next cycle re-attempts with a fresh operation.
 Pending worker-stop requests block controller-ready acknowledgment until they
 are delivered, and candidate health cannot clear a changed update-request nonce.
 Only published worker manifests are adopted. An interrupted manifest write stays
@@ -518,6 +525,17 @@ window do not download, run doctor, or pause claims. At expiry the supervisor
 fetches the **latest** channel manifest, coalescing intermediate builds, even if
 no new publication event arrives. Drain attempts still wait at most 15 minutes;
 they never kill active writers. During the work window normal capacity rules apply.
+
+**The drain deadline is enforced, not advisory.** An admission hold
+(`request.json`) never outlives its operation deadline. A wait still open when
+the 15-minute drain deadline passes — for example a rollback blocked on a
+non-idle candidate whose slots include dead writers that can never acknowledge
+— is aborted: the supervisor releases the hold so gateway readiness recovers,
+raises a stop-the-line ops alarm naming the blocking cause, and re-attempts
+with a fresh operation after the useful-work window. Restarts reconcile the
+saved journal against the running controller the same way: a rollback whose
+target is already running and healthy finalizes as confirmed instead of
+resuming the rollback.
 
 The updater is an independently installed Python script: replacing the runner
 binary alone does **not** refresh it. To adopt an updater fix on an existing

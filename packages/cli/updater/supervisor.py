@@ -434,6 +434,22 @@ class Supervisor:
         message = f"Bridge recovery {outcome.value} on {os.uname().nodename}: {op.source[:9]} → {op.target[:9]}"
         self.save(Finished(op, outcome, deadline, rejected, message))
 
+    def abort(self, op, cause):
+        # An expired operation has no completion path: the deadline is the
+        # outer bound on every wait and the admission hold must never outlive
+        # it. Release the hold first — an alarm outage must not keep the
+        # gateway starved — then raise the stop-the-line alarm naming the
+        # blocking cause and let the next cycle re-attempt with a fresh
+        # operation reconciled from the running controller. The unsaved
+        # journal retries the alarm on later cycles.
+        self.release_request(op)
+        message = f"Bridge update supervisor aborted an expired operation on {os.uname().nodename}: {op.source[:9]} → {op.target[:9]} — deadline passed with no completion path: {cause}"
+        try:
+            self.run([str(self.binary), "alarm", "--kind", "ops", message])
+        except (OSError, subprocess.SubprocessError):
+            return
+        self.save(Idle(max(op.next_attempt_at, int(time.time() * 1000) + USEFUL_WORK_SECONDS * 1000)))
+
     def wait(self, reason, detail, resume, seconds=5):
         self.save(Waiting(reason, detail, int(time.time() * 1000) + seconds * 1000, resume))
 
@@ -510,7 +526,32 @@ class Supervisor:
                            now + DRAIN_SECONDS * 1000, state.next_attempt_at, 0)
             self.save(Preparing(op, artifact["url"], artifact["sha256"]))
         elif isinstance(state, Waiting):
+            resume = state.resume
+            if (state.reason is Reason.TRANSPORT and isinstance(resume, (Reconciling, Installing, Verifying, Restoring, VerifyingRestored))
+                    and now >= resume.operation.deadline):
+                # The deadline is real: an admission hold never outlives its
+                # operation. A transport wait that can no longer complete is
+                # an aborted operation, not another silent retry; the next
+                # cycle re-attempts with a fresh operation.
+                self.abort(resume.operation, state.detail)
+                return
             if now >= state.retry_at:
+                if isinstance(resume, (Restoring, VerifyingRestored)):
+                    # Re-entry reconciliation: a rollback journal is not
+                    # authority over a running, health-observable controller.
+                    # A restart or wait re-entry re-observes the saved
+                    # candidate instead of demanding its rollback-hold
+                    # acknowledgement — dead writers cannot report themselves
+                    # dead, so that gate can never be satisfied by a candidate
+                    # carrying zombie slots. Live health decides the outcome;
+                    # only a genuinely mid-flight rollback resumes the journal.
+                    try:
+                        current = self.process()
+                    except (OSError, RuntimeError, subprocess.SubprocessError):
+                        current = None
+                    if current and current.commit == resume.operation.target:
+                        self.save(Verifying(resume.operation, now, Verification.ALREADY_RUNNING))
+                        return
                 if state.reason is Reason.RESTORED_HEALTH:
                     op = state.resume.operation
                     current = self.process()
@@ -702,7 +743,11 @@ class Supervisor:
             elif state.step is InstallStep.STOP:
                 if current:
                     if current.commit != op.target or not self.idle(op, current):
-                        raise RuntimeError("candidate has not acknowledged its exact rollback hold")
+                        ack = read(self.root / "idle.json", {})
+                        raise RuntimeError(
+                            f"rollback blocked on non-idle candidate {current.commit[:9]} pid {current.pid}: "
+                            f"idle acknowledgement (phase {ack.get('phase')!r}, pid {ack.get('pid')}, "
+                            f"nonce {str(ack.get('nonce'))[:8]}) does not prove this candidate's rollback hold")
                     self.service("stop")
                 self.save(replace(state, step=InstallStep.SWAP))
             elif state.step is InstallStep.SWAP:

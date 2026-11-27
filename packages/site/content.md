@@ -125,6 +125,11 @@ worktrees. Busy controller boundaries are thawed, independent workers continue,
 and uncertain writers or outside actions remain protected. An unproved record
 creates one explicit wait instead of another restart loop. The separate old cleanup
 commands and independent recovery ladders have been removed.
+Restarts and wait re-entries reconcile the journal against the running controller
+and live health: a rollback journal whose target is already running and healthy
+finalizes as confirmed, and an admission hold never outlives its operation
+deadline — an expired wait aborts, releases the hold and raises a stop-the-line
+ops alarm naming the blocking cause.
 Ready health is distinct from an idle/handoff acknowledgement, so healthy busy
 controllers do not fail startup verification merely because jobs are still active.
 Newer supervisor bootstraps also reject older embedded coordinator revisions.
@@ -365,6 +370,11 @@ through the same exact managed-PID/nonce idle, digest, doctor and health gates.
 Preparation survives restart without clearing the hold, and known failed
 candidates are not replayed. A rollback-loop repair refreshes only the independent
 supervisor; it never fabricates health receipts or removes the writer hold.
+The deadline is enforced, not advisory: an admission hold never outlives its
+operation deadline, and a wait still open past it aborts — releasing the hold,
+alarming with the blocking cause (a rollback blocked on a non-idle candidate,
+for example) and re-attempting with a fresh operation. Restarts reconcile the
+saved journal against the running controller and live health.
 
 **The outer loop that cajoles your agents & humans**
 

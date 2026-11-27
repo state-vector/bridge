@@ -53,6 +53,7 @@ class Machine:
         self.doctor_ok = True
         self.export_source = None
         self.notice_protocol = 0
+        self.alarms = []
 
     def fetch(self, url, timeout):
         self.fetches.append(url)
@@ -139,6 +140,7 @@ class Harness(m.Supervisor):
             return self.machine.export_source
         elif args[1] == "alarm":
             self.machine.actions.append("notify")
+            self.machine.alarms.append(args[-1])
         else:
             raise AssertionError(args)
         return ""
@@ -425,6 +427,83 @@ class RecoveryTests(unittest.TestCase):
         m.atomic(self.u.state_path,state);m.atomic(self.u.request,{"nonce":NONCE})
         self.u=Harness(self.machine);self.u.reconcile()
         self.assertIsInstance(self.u.state,m.Idle);self.assertEqual(self.machine.actions,["notify"])
+        self.assertFalse(self.u.request.exists())
+
+    def test_restart_reconciles_stale_rollback_journal_against_running_healthy_target(self):
+        # The 2026-11-27 wedge: the journal says Restoring while the target is
+        # already running and healthy. Reconcile against reality, never resume
+        # the rollback — a candidate with zombie slots can never acknowledge
+        # a hold because dead writers cannot report themselves dead.
+        op=m.Operation(NONCE,OLD,NEW,"main",m.Process(123,"boot","100",OLD),10000000,10900000,0,1)
+        self.u.binary.write_bytes(self.machine.binary)
+        self.machine.current=m.Process(123,"boot","100",NEW)
+        self.machine.ack=False
+        m.atomic(self.u.state_path,m.encode(m.Waiting(m.Reason.TRANSPORT,
+            "rollback blocked on non-idle candidate",10000000,m.Restoring(op,m.InstallStep.STOP))))
+        m.atomic(self.u.request,{"nonce":NONCE})
+        self.u=Harness(self.machine);self.u.reconcile()
+        self.assertIsInstance(self.u.state,m.Idle)
+        self.assertEqual(self.machine.actions,["notify"])
+        self.assertFalse(self.u.request.exists())
+        self.assertEqual(self.u.state.next_attempt_at,op.next_attempt_at)
+
+    def test_expired_transport_wait_aborts_and_releases_hold_with_alarm(self):
+        # The deadline is real: an admission hold never outlives its
+        # operation, even before the wait's own retry window opens.
+        op=m.Operation(NONCE,OLD,NEW,"main",m.Process(123,"boot","100",OLD),10000000,10900000,0,1)
+        self.u.binary.write_bytes(self.machine.binary)
+        self.machine.current=m.Process(123,"boot","100",NEW)
+        self.machine.healthy[NEW]=False;self.machine.ack=False
+        detail="rollback blocked on non-idle candidate bbbbbbbbb pid 123: idle acknowledgement (phase 'idle', pid 999, nonce 'dddddddd') does not prove this candidate's rollback hold"
+        m.atomic(self.u.state_path,m.encode(m.Waiting(m.Reason.TRANSPORT,detail,11001000,m.Restoring(op,m.InstallStep.STOP))))
+        m.atomic(self.u.request,{"nonce":NONCE})
+        self.machine.clock=11000.0
+        self.u=Harness(self.machine);self.u.reconcile()
+        self.assertIsInstance(self.u.state,m.Idle)
+        self.assertFalse(self.u.request.exists())
+        self.assertEqual(self.machine.actions,["notify"])
+        self.assertEqual(self.machine.alarms,[f"Bridge update supervisor aborted an expired operation on test-host: {OLD[:9]} → {NEW[:9]} — deadline passed with no completion path: {detail}"])
+        self.assertGreaterEqual(self.u.state.next_attempt_at,14600000)
+
+    def test_rollback_hold_gate_error_names_the_nonidle_cause(self):
+        op=m.Operation(NONCE,OLD,NEW,"main",m.Process(123,"boot","100",OLD),10000000,10900000,0,1)
+        self.u.backup.write_bytes(b"old binary")
+        self.machine.current=m.Process(123,"boot","100",NEW)
+        self.machine.ack=False
+        m.atomic(self.u.request,{"nonce":NONCE})
+        self.u.save(m.Restoring(op,m.InstallStep.STOP))
+        self.u.reconcile()
+        self.assertIsInstance(self.u.state,m.Waiting)
+        self.assertEqual(self.u.state.reason,m.Reason.TRANSPORT)
+        self.assertIn("rollback blocked on non-idle candidate",self.u.state.detail)
+        self.assertIn("pid 123",self.u.state.detail)
+
+    def test_midflight_rollback_wait_within_deadline_still_resumes(self):
+        # Only a stale journal reconciles; a genuinely mid-flight rollback
+        # whose source is back and running resumes and verifies it.
+        op=m.Operation(NONCE,OLD,NEW,"main",m.Process(123,"boot","100",OLD),10000000,10900000,0,1)
+        self.u.backup.write_bytes(b"old binary")
+        self.machine.current=m.Process(123,"boot","100",OLD)
+        m.atomic(self.u.state_path,m.encode(m.Waiting(m.Reason.TRANSPORT,
+            "rollback blocked on non-idle candidate",10000000,m.Restoring(op,m.InstallStep.STOP))))
+        m.atomic(self.u.request,{"nonce":NONCE})
+        self.u=Harness(self.machine);self.u.reconcile()
+        self.assertIsInstance(self.u.state,m.Idle)
+        self.assertEqual(self.u.state.rejected,NEW)
+        self.assertEqual(self.machine.actions,["notify"])
+        self.assertFalse(self.u.request.exists())
+
+    def test_midflight_forward_wait_within_deadline_still_resumes(self):
+        op=m.Operation(NONCE,OLD,NEW,"main",m.Process(123,"boot","100",OLD),10000000,10900000,0,1)
+        candidate=self.u.candidate(op);candidate.parent.mkdir(parents=True);candidate.write_bytes(self.machine.binary)
+        self.machine.current=None
+        m.atomic(self.u.state_path,m.encode(m.Waiting(m.Reason.TRANSPORT,
+            "Runner service is still activating at the installation boundary",10000000,
+            m.Installing(op,m.digest(candidate),m.InstallStep.SWAP))))
+        m.atomic(self.u.request,{"nonce":NONCE})
+        self.u=Harness(self.machine);self.drive()
+        self.assertEqual(self.machine.current.commit,NEW)
+        self.assertEqual(self.machine.actions,["start","notify"])
         self.assertFalse(self.u.request.exists())
 
     def test_confirmed_older_native_cannot_downgrade_the_bootstrapped_coordinator(self):
