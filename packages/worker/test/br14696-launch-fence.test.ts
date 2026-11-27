@@ -264,6 +264,30 @@ describe("BR#14696 W1: launch-health fence", () => {
     const events = await kbJson("/events?since=0&limit=500");
     expect((events.body.events as any[]).some(e => e.op === "launch_failed" && e.artefact_id === card.id)).toBe(false);
   });
+
+  it("defers to the owner-death interrupted park (BR#23279): a dispatched claim with a provably dead owner is never fenced to todo", async () => {
+    const host = await gatewayHost("fence-precedence-host");
+    const created = await kbJson("/create", { type: "task", title: "Deep-stale dispatched specimen", project: "bridge", qualified: true, roles: ["impl"] });
+    expect(created.status, JSON.stringify(created.body)).toBe(200);
+    const id = String(created.body.id);
+    await claimDirectly(host, id, 9);
+    const card = await kbJson("/get", { id });
+    expect(card.body.meta?.execution_claim, "the gateway-tagged claim stamps execution_claim (BR#23279)").toBeTruthy();
+
+    // Never signaled (no progress, no post-claim ping), but time-travel past
+    // the owner-staleness bar: the owner has had no live session for ~5h and
+    // the card is equally stale. The fence must NOT reap this dead-at-launch —
+    // the owner-death leg owns the exit (interrupted park with the resume
+    // record and the bounded budget, BR#23279); fencing it to todo would
+    // sever that record. The young dead launch (owner alive) stays the
+    // fence's subject — that law is the test above.
+    await sweep(Number(card.body.status_ts) + 5 * 60 * MIN);
+    const after = (await kbJson("/get", { id })).body;
+    expect(after.status, "a deep-stale dispatched claim parks interrupted (BR#23279), it is never fenced to todo").toBe("interrupted");
+    expect(after.meta?.interrupted?.owner, "the park preserves the resume record the fence would have severed").toContain("/fixture-worker");
+    const events = await kbJson("/events?since=0&limit=500");
+    expect((events.body.events as any[]).some(e => e.op === "launch_failed" && e.artefact_id === id)).toBe(false);
+  });
 });
 
 describe("BR#14696 W1: launch circuit breaker", () => {

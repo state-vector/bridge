@@ -1932,18 +1932,48 @@ export class KnowledgeHub {
       // boot past the fence) costs one re-dispatch, never a lost claim: the
       // card releases claimable either way. Three consecutive dead launches
       // with no healthy launch in between open the circuit (below the loop).
+      const claimedAt = Number(r.status_ts ?? r.updated_ts ?? 0);
       const firstSignal = Math.max(
         meta.session_alive_ts ?? 0,
         sessionSignal,
         meta.last_progress?.session === meta.session ? meta.last_progress?.ts ?? 0 : 0,
       );
-      const claimedAt = Number(r.status_ts ?? r.updated_ts ?? 0);
+      // Durable launch evidence (BR#23279 reconciliation): a post-claim row in
+      // the progress ledger (artefact_versions) proves the run came up —
+      // evidence later bookkeeping cannot rewrite. The owner-death leg ages a
+      // lost executor's volatile views (last_progress, session pings) back to
+      // claim time; without this probe those cards read "never signaled" and
+      // the fence severed the interrupted park's resume state (todo instead
+      // of interrupted).
+      const postClaimProgress = !!this.one(
+        `SELECT 1 AS n FROM artefact_versions WHERE artefact_id = ? AND action = 'progress' AND ts > ? LIMIT 1`,
+        String(r.id), claimedAt + LAUNCH_SIGNAL_SKEW_MS,
+      );
       // A ping stamped at claim time is the dispatch's own session
       // registration, not a signal from the launched run — only a signal
       // NEWER than the claim (skew-tolerant) proves the run came up.
-      const launchSignal = firstSignal > claimedAt + LAUNCH_SIGNAL_SKEW_MS ? firstSignal : 0;
+      const launchSignal = firstSignal > claimedAt + LAUNCH_SIGNAL_SKEW_MS || postClaimProgress
+        ? Math.max(firstSignal, claimedAt + LAUNCH_SIGNAL_SKEW_MS + 1)
+        : 0;
       if (launchSignal > 0 && now - claimedAt < LAUNCH_HEALTHY_LAUNCH_WINDOW_MS) healthyLaunch = true;
-      if (launchSignal === 0 && now - claimedAt > fenceMs && !releaseHold(meta)) {
+      // BR#23279 precedence: the owner-death backstop owns a dispatched claim
+      // whose owner is PROVABLY dead (no live session past owner_stale_hours)
+      // and whose card is equally stale — there the interrupted park (resume
+      // record, bounded budget, interrupted_lapse accounting) is the law, and
+      // fencing it to todo would sever that record. The fence's subject is the
+      // young dead launch: a never-signaled claim inside the owner-liveness
+      // window (the gateway is alive, the launched run never came up). Same
+      // settings bar and owner-liveness read as the (E) leg below.
+      const ownerStaleRow = this.one(`SELECT value FROM settings WHERE key = 'owner_stale_hours'`);
+      const ownerStaleMs = (ownerStaleRow ? Math.max(1, Math.min(168, parseInt(String(ownerStaleRow.value), 10) || 4)) : 4) * 3_600_000;
+      const ownerSeenTs = Number(this.one(
+        `SELECT MAX(s.last_seen_ts) AS seen FROM sessions s JOIN auth_tokens t ON t.id = s.token_id WHERE t.label = ? OR t.principal = ?`,
+        String(r.owner), String(r.owner),
+      )?.seen ?? 0);
+      const ownerCardTs = Math.max(meta.last_progress?.ts ?? 0, meta.session_alive_ts ?? 0, claimedAt, Number(r.updated_ts ?? 0));
+      const ownerDeathPark = meta.execution_claim && !meta.interactive_execution
+        && now - ownerSeenTs > ownerStaleMs && now - ownerCardTs > ownerStaleMs;
+      if (launchSignal === 0 && now - claimedAt > fenceMs && !releaseHold(meta) && !ownerDeathPark) {
         // The hold exemption (BR#4067): a card carrying machine-wait state —
         // a merge-train queue slot, a typed await_event, a bound ask — is NOT
         // waiting on its dispatched session; its exit is machine-owned and the
@@ -4827,7 +4857,7 @@ export class KnowledgeHub {
     const recentFloor = Math.max(since, recentTs);
     const events: any[] = [];
     const push = (row: any) => events.push(row);
-    const signals = { progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, result_lost: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0, verify_duty_backlog: 0, train_red: 0 };
+    const signals = { progress_count: 0, gauge_count: 0, thin_notes: 0, abandoned: 0, result_lost: 0, launch_failed: 0, reassigned: 0, asks_received: 0, asks_answered_on_time: 0, artefacts_created: 0, verify_duty_backlog: 0, train_red: 0 };
 
     // progress ledger rows (RECENT_PROGRESS_SQL's row set, label-scoped)
     if (want("progress")) {
@@ -4859,9 +4889,11 @@ export class KnowledgeHub {
         try { d = JSON.parse(r.detail ?? "{}"); } catch { d = {}; }
         if (String(d?.released_owner || r.owner || "") !== label) continue; // pre-stamp rows attributed by current owner only
         const counts = d?.result_class === "completed_result_lost" ? "result_lost"
+          : d?.result_class === LAUNCH_FAILED_RESULT_CLASS ? "launch_failed" // BR#14696 — dead-at-launch machine reap, zero score impact
           : d?.result_class ? "none" // proxy_wait_hold / bounce_reentry_demote / machine_wait_stall / interrupted_park / interrupted_lapse — no-counter classes (BR#4067/BR#4494/GH#491/BR#23279)
           : "abandoned";
         if (counts === "result_lost") signals.result_lost++;
+        else if (counts === "launch_failed") signals.launch_failed++;
         else if (counts === "abandoned") signals.abandoned++;
         push({ kind: "watchdog_transition", ts: r.ts, artefact_id: r.artefact_id, result_class: d?.result_class ?? null, counts, note: String(d?.note ?? "").slice(0, 160), observed_by: d?.observed_by ?? null, released_session: d?.released_session ?? null });
       }
