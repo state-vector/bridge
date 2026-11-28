@@ -980,3 +980,124 @@ fn a_failed_record_save_still_leaves_a_fresh_status_proof() {
     assert!(owner.status().unwrap().observed_at>before,"measure re-proved admission after the failed save");
     *super::super::attempt_journal::FAIL_FIRST_WRITE.lock().unwrap()=None;
 }
+
+#[test]
+fn absorbing_budget_stall_escalates_bounded_and_reverts_when_the_overage_clears() {
+    let sandbox=Sandbox::new();let owner=sandbox.owner();ready(&owner);
+    // BR#6992 live shape: an in-use allocation over a tiny budget. Nothing
+    // advances (the ladder owes nothing while the record is InUse), every
+    // full pass re-measures byte-identical counters — the frozen deadlock
+    // that starved the gateway for 5+ hours on 2026-11-27.
+    let t=ticket("parked");let a=owner.allocate(&t,None).unwrap();
+    fs::write(a.work.join("wip"),vec![0u8;64*1024]).unwrap();
+    let budget=1u64;
+    let measure=|owner:&Owner| owner.measure_with_limits_bounded(budget,0,0).unwrap();
+    let baseline=measure(&owner);
+    assert!(matches!(baseline.admission,Admission::Held {..}));
+    assert_eq!(baseline.stall_passes,0);
+    for i in 1..STALL_PASSES {
+        let status=measure(&owner);
+        assert_eq!(status.stall_passes,i,"pass {i}: the stall counts frozen full passes");
+        assert!(matches!(status.admission,Admission::Held {..}));
+        assert!(status.escalation.is_none(),"pass {i}: no escalation before the proof bar");
+        assert!(status.wedge.is_none(),"pass {i}: not wedged before the proof bar");
+    }
+    let grant=measure(&owner);
+    assert_eq!(grant.stall_passes,STALL_PASSES);
+    let escalation=grant.escalation.as_ref().expect("a proven absorbing stall escalates the budget");
+    assert_eq!(escalation.from_bytes,budget);
+    assert_eq!(escalation.to_bytes,grant.admissible_bytes.unwrap().saturating_add(ESCALATION_SLACK),"the grant is bounded to one slack above the stalled total");
+    assert!(matches!(grant.admission,Admission::Ready),"the escalation re-opens dispatch");
+    // Durable and honoured: the sampler (no du, no stall counting) evaluates
+    // admission against the escalated budget while the overage persists.
+    let sampled=owner.refresh_admission_with(budget,0).unwrap();
+    assert!(matches!(sampled.admission,Admission::Ready),"the sampler honours the escalation");
+    assert_eq!(sampled.escalation,grant.escalation);
+    assert!(matches!(owner.refresh_admission_with(budget,u64::MAX).unwrap().admission,Admission::Held {..}),"the disk floor stays the hard safety even while escalated");
+    // A later full pass carries the escalation while the overage persists.
+    assert_eq!(measure(&owner).escalation,grant.escalation);
+    // A config change retires the escalation rather than carrying it across.
+    assert!(owner.refresh_admission_with(2,0).unwrap().escalation.is_none());
+    // The overage clears: the escalation self-reverts and the stall resets.
+    fs::write(a.work.join("wip"),vec![0u8;1024]).unwrap();
+    let reverted=measure(&owner);
+    assert!(reverted.escalation.is_none(),"the escalation self-reverts once admissible drops below the configured budget");
+    assert!(matches!(reverted.admission,Admission::Held {..}),"a fresh overage starts from a clean proof");
+    assert_eq!(reverted.stall_passes,0,"movement — any movement — resets the stall");
+}
+
+#[test]
+fn proven_stall_without_margin_headroom_wedges_loudly_instead_of_escalating() {
+    let sandbox=Sandbox::new();let owner=sandbox.owner();ready(&owner);
+    let t=ticket("tight");let a=owner.allocate(&t,None).unwrap();
+    fs::write(a.work.join("wip"),vec![0u8;64*1024]).unwrap();
+    // An unreachable escalation margin: the floor never trips, the budget leg
+    // holds, and the zero-progress stall must surface as a WEDGE (the
+    // generalized BR#14716 verdict) instead of a grant.
+    for i in 0..=STALL_PASSES {
+        let status=owner.measure_with_limits_bounded(1,0,u64::MAX).unwrap();
+        assert!(matches!(status.admission,Admission::Held {..}));
+        assert!(status.escalation.is_none(),"no escalation without margin headroom");
+        if i<STALL_PASSES { assert!(status.wedge.is_none(),"pass {i}: not wedged before the proof bar"); }
+        else { assert!(status.wedge.is_some(),"the zero-progress stall is a wedge verdict, not idle"); }
+    }
+}
+
+#[test]
+fn the_stall_proof_requires_identical_counters_and_a_budget_leg_hold() {
+    let sandbox=Sandbox::new();let owner=sandbox.owner();ready(&owner);
+    let t=ticket("moving");let a=owner.allocate(&t,None).unwrap();
+    fs::write(a.work.join("wip"),vec![0u8;64*1024]).unwrap();
+    // Movement (bytes growing between passes) resets the stall: a healthy
+    // dispatch burst must never look like an absorbing deadlock. (8 KiB
+    // steps: smaller deltas vanish inside filesystem block granularity.)
+    for i in 0..(STALL_PASSES*2) {
+        fs::write(a.work.join("wip"),vec![0u8;(64+i as usize*8)*1024]).unwrap();
+        let status=owner.measure_with_limits_bounded(1,0,0).unwrap();
+        assert_eq!(status.stall_passes,0,"counter movement resets the stall");
+        assert!(status.escalation.is_none());
+    }
+    // An overage under a floor hold is a real disk problem, not a budget
+    // deadlock: the passes still count as zero progress (the wedge verdict
+    // applies to a full volume too), but no escalation can ever grant out
+    // of it — the margin gate cannot be satisfied below the floor.
+    for i in 0..=(STALL_PASSES+1) {
+        let status=owner.measure_with_limits_bounded(1,u64::MAX,0).unwrap();
+        assert!(matches!(status.admission,Admission::Held {..}));
+        assert!(status.escalation.is_none(),"no escalation can grant below the floor");
+        if i>=STALL_PASSES { assert!(status.wedge.is_some(),"a full-volume zero-progress stall is a wedge verdict"); }
+    }
+}
+
+#[test]
+fn budget_hold_reason_fences_only_a_fresh_budget_leg_hold() {
+    let sandbox=Sandbox::new();
+    let cfg: DispatchConfig = serde_json::from_value(json!({"url":"http://127.0.0.1:1","label":"workspace-budget-fence","workdir":sandbox.0.join("disk")})).unwrap();
+    let ledger=gateway_pipeline::root(&cfg).unwrap().join("workspaces");
+    fs::create_dir_all(&ledger).unwrap();
+    let write_status=|admission:serde_json::Value,admissible:u64,available:u64,age_ms:u64|{
+        journal::write_file(&ledger.join("status.json"),&serde_json::to_vec(&json!({
+            "observed_at":now_ms().saturating_sub(age_ms),"last_reconciled_at":now_ms(),"managed_bytes":admissible,"cache_bytes":0,"evidence_bytes":0,"reclaimed_bytes":0,
+            "resources":1,"pending":1,"retained":0,"budget_bytes":0,"available_bytes":available,"admission":admission,
+            "admissible_bytes":admissible,"preserved_bytes":0})).unwrap()).unwrap();
+    };
+    let held=json!({"kind":"held","reason":"workspace disk budget: reclamation continues"});
+    // Fresh budget-leg hold: named and loud.
+    write_status(held.clone(),150*1024*1024*1024,100*1024*1024*1024,0);
+    let reason=Owner::budget_hold_reason(&cfg).expect("a fresh budget hold advertises");
+    assert!(reason.contains("workspace disk budget"),"{reason}");
+    // The advertised inventory carries the fence: masked availability + resource_hold.
+    let fenced=super::super::inventory_with_runtime(&cfg,json!({"backend":"test","availability":{"kind":"usable","model":"m"},"alternatives":[]}),None);
+    assert_eq!(fenced["availability"]["kind"],"unavailable","the budget hold masks the advertised availability");
+    assert!(fenced["resource_hold"]["reason"].as_str().unwrap().contains("workspace disk budget"),"the hub sees a named resource_held host");
+    // Stale proof: fail open — local admission remains the authoritative gate.
+    write_status(held.clone(),150*1024*1024*1024,100*1024*1024*1024,121_000);
+    assert!(Owner::budget_hold_reason(&cfg).is_none(),"a stale proof is not advertised");
+    // Ready admission: nothing to fence.
+    write_status(json!({"kind":"ready"}),10,100*1024*1024*1024,0);
+    assert!(Owner::budget_hold_reason(&cfg).is_none());
+    // The floor leg owns its own first-hand fence, not this one.
+    write_status(held,10,0,0);
+    assert!(Owner::budget_hold_reason(&cfg).is_none(),"a floor hold is the floor leg's advertisement");
+    let _=fs::remove_dir_all(gateway_pipeline::root(&cfg).unwrap());
+}

@@ -108,6 +108,12 @@ class Harness(m.Supervisor):
             raise Crash()
 
     def service(self, action):
+        if action == "restart":
+            # BR#6992 starve disposition: a same-build participant restart
+            # carries no admission hold and no recovery operation.
+            self.machine.actions.append(action)
+            self.machine.current = m.Process(130 + len(self.machine.actions), "boot", str(300 + len(self.machine.actions)), self.machine.current.commit if self.machine.current else OLD)
+            return
         op = self.state.operation
         self.assert_hold(op)
         self.machine.actions.append(action)
@@ -519,6 +525,85 @@ class RecoveryTests(unittest.TestCase):
         cli=Path(__file__).parents[1]/"src/main.rs"
         for command in ("reconcile-stopped","reconcile-reservations"):
             self.assertNotIn(command,cli.read_text())
+
+    # BR#6992 root-fix #6 — persistent starve health drives disposition.
+
+    def park_receipt(self, **over):
+        receipt={"pid":self.machine.current.pid,"commit":OLD,"observed_at":int(self.machine.clock*1000),
+                 "parked":True,"parked_reason":"dispatch parked on workspace disk: budget","in_flight":0,
+                 "starved_since":int((self.machine.clock-31*60)*1000)}
+        receipt.update(over)
+        m.atomic(self.u.root/"dispatch-health.json",receipt)
+
+    def idle_with_future_attempt_budget(self):
+        self.u.save(m.Idle(int(self.machine.clock*1000)+3600*1000))
+
+    def test_starve_parked_controller_is_restarted_once_with_alarm_and_cooldown(self):
+        self.idle_with_future_attempt_budget()
+        self.park_receipt()
+        self.u.step()
+        self.assertIn("restart",self.machine.actions)
+        history=m.read(self.u.root/"starve-restarts.json",{})
+        self.assertEqual(history["count"],1,"the restart is journalled")
+        self.assertTrue(any("starve-parked" in alarm for alarm in self.machine.alarms),"the disposition alarms")
+        # Inside the cooldown the same persistent park never restarts again.
+        self.machine.clock+=10*60
+        self.park_receipt()
+        self.u.step()
+        self.assertEqual(self.machine.actions.count("restart"),1)
+
+    def test_starve_disposition_requires_the_running_controllers_persistent_park(self):
+        self.idle_with_future_attempt_budget()
+        # Another controller's residue is not authority.
+        self.park_receipt(pid=999)
+        self.u.step();self.assertNotIn("restart",self.machine.actions)
+        # Active work is never interrupted by a disposition.
+        self.park_receipt(in_flight=2)
+        self.u.step();self.assertNotIn("restart",self.machine.actions)
+        # A park that has not persisted yet is noise, not a verdict.
+        self.park_receipt(starved_since=int((self.machine.clock-10*60)*1000))
+        self.u.step();self.assertNotIn("restart",self.machine.actions)
+        # An admission hold owns the runner's lifecycle exclusively.
+        m.atomic(self.u.request,{"nonce":NONCE})
+        self.park_receipt()
+        self.u.step();self.assertNotIn("restart",self.machine.actions)
+        self.u.request.unlink()
+        # No receipt, no disposition.
+        (self.u.root/"dispatch-health.json").unlink()
+        self.u.step();self.assertNotIn("restart",self.machine.actions)
+        self.assertEqual(m.read(self.u.root/"starve-restarts.json",{}).get("count",0),0)
+
+    def test_starve_era_caps_at_three_restarts_and_resets_after_healthy_cooldown(self):
+        for expected_count in (1,2,3):
+            self.idle_with_future_attempt_budget()
+            self.park_receipt()
+            self.u.step()
+            self.assertEqual(self.machine.actions.count("restart"),expected_count)
+            self.machine.clock+=2*60*60+60
+        # Past the cap the park persists loudly but restarts no more.
+        self.idle_with_future_attempt_budget()
+        self.park_receipt()
+        self.u.step()
+        self.assertEqual(self.machine.actions.count("restart"),3)
+        # A healthy interval past the cooldown closes the era.
+        self.machine.clock+=2*60*60+60
+        self.idle_with_future_attempt_budget()
+        m.atomic(self.u.root/"dispatch-health.json",{"pid":self.machine.current.pid,"parked":False,"in_flight":0})
+        self.u.step()
+        self.assertEqual(m.read(self.u.root/"starve-restarts.json",{})["count"],0)
+        # A future episode restarts fresh evidence with a full budget.
+        self.idle_with_future_attempt_budget()
+        self.park_receipt()
+        self.u.step()
+        self.assertEqual(self.machine.actions.count("restart"),4)
+
+    def test_starve_disposition_never_runs_mid_operation(self):
+        op=m.Operation(NONCE,OLD,NEW,"main",m.Process(123,"boot","100",OLD),
+                       int(self.machine.clock*1000),int(self.machine.clock*1000)+900*1000,0,0)
+        self.u.save(m.Handoff(op,m.digest(Path(self.u.binary))))
+        self.park_receipt()
+        self.u.step()
+        self.assertNotIn("restart",self.machine.actions,"an operation in flight owns stop/start exclusively")
 
 
 class RealProcessRecoveryTests(unittest.TestCase):

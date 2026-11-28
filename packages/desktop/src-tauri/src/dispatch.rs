@@ -244,7 +244,7 @@ fn update_request() -> Option<UpdateRequest> {
     }
 }
 
-fn update_receipt(name: &str, value: &serde_json::Value) {
+pub(crate) fn update_receipt(name: &str, value: &serde_json::Value) {
     if let Ok(home) = std::env::var("HOME") {
         let path = PathBuf::from(home).join(".bridge/update").join(name);
         let tmp = path.with_extension("tmp");
@@ -742,8 +742,17 @@ fn inventory_with_runtime(cfg: &DispatchConfig, facts: serde_json::Value, reques
     let mut facts = inventory_dispatch_hold(facts, request.is_some());
     // BR#6992 — a full workspace volume fences the inventory loudly. Fail-open
     // only when the volume cannot be measured: local admission (the workspace
-    // reconcile) remains the authoritative gate either way.
-    if let Some(reason) = disk_headroom_hold(cfg) { facts = inventory_resource_hold(facts, &reason); }
+    // reconcile) remains the authoritative gate either way. The budget leg
+    // (admissible at/above BRIDGE_WORKSPACE_BUDGET_GIB from the durable
+    // admission proof) rides the same fence as the floor leg: the hub shows a
+    // named `resource_held` host instead of reading a parked gateway as a
+    // silently starved scheduler — the exact 2026-11-27 failure mode, where
+    // 12 eligible tasks waited 5+ hours behind a budget hold the board could
+    // only see as `eligible_work_not_reserved`. The floor leg is measured
+    // first-hand and wins when both trip.
+    let reason = disk_headroom_hold(cfg)
+        .or_else(|| workspace::Owner::budget_hold_reason(cfg));
+    if let Some(reason) = reason { facts = inventory_resource_hold(facts, &reason); }
     let channel = cfg.auto_update.as_ref().filter(|update| update.enabled)
         .and_then(|update| match update.channel {
             UpdateChannel::Main => Some("main"),

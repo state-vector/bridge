@@ -28,7 +28,20 @@ declares a named resource hold and masks its models unavailable with the disk
 reason, so the board shows `resource_held` with that reason — never a silently
 starved scheduler — and the fence lifts on the next clean advertise once the
 volume recovers. Older hubs that do not know the field still fail closed on
-the masked availability.
+the masked availability. An over-budget hold rides the same fence (BR#6992):
+a budget-parked gateway advertises `resource_held: workspace disk budget…`
+and logs the dispatch park, instead of starving silently behind an
+`eligible_work_not_reserved` episode.
+An over-budget hold that cannot drain is an absorbing deadlock when the
+admissible bytes are open-task worktrees (BR#6992): the ladder's
+task-liveness grace holds them, and dispatch — the only thing that closes
+their tasks — is fenced by the same hold. The owner proves this from its own
+ledger (eight consecutive full passes with byte-identical counters) and
+escalates the budget, self-reverting, by 8 GiB of slack above the stalled
+total — only while 32 GiB stay free beside the hard floor, alarmed on every
+grant, reverting below the configured budget or on any config change.
+Without that headroom the stall trips the generalized wedge verdict
+(BR#14716 extended to zero-progress holds) so it is never read as idle.
 New allocations pause when the budget is exceeded; reclamation continues, with one slot per pass for the largest eligible released workspace. The owner can reclaim the declared Bridge worker dry-run bundle from stopped workspaces when it contains only the expected generated files, and the nested CLI target when Cargo marks it as a cache and no files are tracked.
 While reclamation runs, a bounded sampling job on the same owner re-proofs
 disk admission every 15 seconds from the last measured inventory plus a fresh
@@ -133,6 +146,13 @@ ops alarm naming the blocking cause.
 Ready health is distinct from an idle/handoff acknowledgement, so healthy busy
 controllers do not fail startup verification merely because jobs are still active.
 Newer supervisor bootstraps also reject older embedded coordinator revisions.
+Persistent starve health also drives disposition (BR#6992): the supervisor reads
+the runner's `dispatch-health.json` receipt and, from its idle state only, a
+park that has persisted 30 minutes with zero active work triggers one bounded
+same-build controller restart — at most one per 2 hours and three per starve
+era, every restart raising the ops alarm with the park reason, the era
+resetting after a healthy cooldown. Detection without action was the
+2026-11-27 failure mode; the sole stop/start owner now owns the reaction.
 
 ### Operational diagnostics
 

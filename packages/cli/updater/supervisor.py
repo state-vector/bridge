@@ -30,6 +30,17 @@ DRAIN_SECONDS = 900
 HEALTH_SECONDS = 180
 STABLE_SECONDS = 15
 OBSERVE_SECONDS = 2
+# BR#6992 root-fix #6 — persistent starve health drives disposition. The
+# 2026-11-27 starve was fully detected (hub episode, board, gateway log) and
+# never actioned for 5+ hours: the runner kept reporting "starved" while the
+# only process with stop/start authority — this supervisor — idled on its
+# update-only state machine. Bounds: a park must persist this long with zero
+# active work before a restart is justified, at most one restart per cooldown
+# window, at most STARVE_RESTART_MAX per starve era (restarts that do not
+# clear the park are evidence, not a retry loop), every restart alarms.
+STARVE_PARK_SECONDS = 30 * 60
+STARVE_RESTART_COOLDOWN = 2 * 60 * 60
+STARVE_RESTART_MAX = 3
 
 
 def fetch(url, timeout):
@@ -453,6 +464,48 @@ class Supervisor:
     def wait(self, reason, detail, resume, seconds=5):
         self.save(Waiting(reason, detail, int(time.time() * 1000) + seconds * 1000, resume))
 
+    def starve_disposition(self):
+        # BR#6992 root-fix #6 — turn persistent starve evidence into a bounded,
+        # journal-visible intervention. The runner's dispatch-health receipt
+        # (written by the gateway Controller every snapshot tick) is first-hand
+        # evidence: `parked` (disk admission not ready) with zero in-flight
+        # work, continuously since `starved_since`. Only the exact running
+        # controller's evidence is authority — a receipt naming another pid is
+        # residue, not a verdict. A same-build restart is a participant
+        # reconnect, not a failed update and not a new retry budget; the
+        # disk-budget class is fixed at the source (the workspace's
+        # self-reverting escalation), this leg covers the controller-wedged
+        # class. Never mid-operation (Idle state only — the caller enforces
+        # it), never past the cooldown or the era cap, and every restart
+        # raises the ops alarm with the park reason.
+        receipt = read(self.root / "dispatch-health.json", {})
+        current = self.process()
+        if not receipt or not current or receipt.get("pid") != current.pid:
+            return
+        # An admission hold means the update machinery owns this runner's
+        # lifecycle — never race it with a disposition.
+        if self.request.exists():
+            return
+        now = int(time.time() * 1000)
+        history = read(self.root / "starve-restarts.json", {})
+        if receipt.get("parked") is not True or receipt.get("in_flight", 0) != 0:
+            # A healthy interval past the cooldown closes the starve era: the
+            # restart budget resets, so a future episode starts fresh.
+            if history.get("count", 0) and now >= history.get("at", 0) + STARVE_RESTART_COOLDOWN * 1000:
+                atomic(self.root / "starve-restarts.json", {"at": history.get("at", 0), "count": 0})
+            return
+        since = receipt.get("starved_since") or 0
+        if not since or now < since + STARVE_PARK_SECONDS * 1000:
+            return
+        if now < history.get("at", 0) + STARVE_RESTART_COOLDOWN * 1000 or history.get("count", 0) >= STARVE_RESTART_MAX:
+            return
+        reason = str(receipt.get("parked_reason") or "dispatch parked")[:300]
+        self.service("restart")
+        atomic(self.root / "starve-restarts.json",
+               {"at": now, "count": history.get("count", 0) + 1, "since": since, "reason": reason})
+        self.run([str(self.binary), "alarm", "--kind", "ops",
+                  f"Bridge update supervisor restarted a starve-parked controller on {os.uname().nodename}: parked since {since} with no active work: {reason}"])
+
     def migrate(self, state):
         old = state.receipt
         original = self.state_path.read_bytes()
@@ -504,6 +557,10 @@ class Supervisor:
         if isinstance(state, Legacy):
             self.migrate(state)
         elif isinstance(state, Idle):
+            # BR#6992 root-fix #6 — starve disposition runs on every Idle
+            # cycle, independent of the update attempt budget: a parked
+            # controller is a health fact, not an update fact.
+            self.starve_disposition()
             config = self.config()
             if not opted_in(config) or now < state.next_attempt_at:
                 return

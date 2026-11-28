@@ -21,6 +21,24 @@ const BATCH: usize = 4;
 /// means the ladder owes the budget bytes; the fair 4-per-30s pass cannot
 /// repay a 684-deep pending pile before the next generation of work arrives.
 const PRESSURE_BATCH: usize = 64;
+/// BR#6992 — full reconcile passes with byte-identical inventory counters
+/// while the budget leg holds admission (zero reclaim progress) that prove
+/// an ABSORBING deadlock. Observed live 2026-11-27: admissible 216 GiB ≥
+/// 200 GiB budget, the admissible bytes are open-task worktrees whose
+/// task-liveness grace (BR#22672) refreshes the affinity clock forever,
+/// and dispatch — the only thing that closes tasks and releases those
+/// trees — is fenced by the very same hold. Eight stalled full passes
+/// (≈30+ minutes at production cadence) is the persistence bar.
+const STALL_PASSES: u32 = 8;
+/// BR#6992 — headroom an escalation grants above the stalled admissible
+/// total: enough for a burst of dispatch (the 2026-11-27 burst grew
+/// managed ~10 GiB in 8 minutes), not a licence to fill the volume.
+const ESCALATION_SLACK: u64 = 8 * GIB;
+/// BR#6992 — free bytes that must remain BESIDE the floor before any
+/// escalation is granted. The floor itself stays the unbypassable hard
+/// safety; the margin is the budget leg's own safety for journal reserves
+/// and cache churn.
+const ESCALATION_MARGIN: u64 = 32 * GIB;
 /// BR#14525 (owner ruling 2026-11-13) — NO git-pushed checkpoints: the
 /// WORKTREE is the durability boundary for WIP. An interrupted generation's
 /// worktree therefore stays adoptable (affinity) and reclaim-protected
@@ -206,6 +224,38 @@ pub struct Status {
     /// cached for the sampler's Held reason.
     #[serde(default)]
     pub preserved_bytes: u64,
+    /// BR#6992 — consecutive FULL reconcile passes whose inventory counters
+    /// (admissible, preserved, pending, retained, managed) were byte-identical
+    /// while the budget leg held admission: zero reclaim progress. Reaching
+    /// `STALL_PASSES` is the absorbing-deadlock proof behind `escalation`.
+    #[serde(default)]
+    pub stall_passes: u32,
+    /// BR#6992 — the active budget escalation (see `BudgetEscalation`).
+    /// `None` = the configured budget is in force.
+    #[serde(default)]
+    pub escalation: Option<BudgetEscalation>,
+}
+
+/// BR#6992 — the self-reverting budget escalation. A proven absorbing
+/// deadlock (budget overage + zero reclaim progress for `STALL_PASSES`
+/// full passes) has exactly one exit short of ops raising the budget:
+/// admit bounded growth so dispatch can resume, tasks can close, and the
+/// ladder can reclaim their trees. Durable in status.json so it survives
+/// restarts exactly like the hold it relieves; reverts automatically once
+/// the overage clears (`admissible < configured budget`). Every grant or
+/// bump is loud: the status carries it, the gateway alarm names it, and
+/// the advertised inventory fences the hub with `resource_hold` while the
+/// budget leg still holds.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BudgetEscalation {
+    /// configured budget at grant — a later config change invalidates the escalation
+    pub from_bytes: u64,
+    /// effective budget while active
+    pub to_bytes: u64,
+    /// granted at (epoch ms)
+    pub at: u64,
+    /// stall passes proven at grant
+    pub passes: u32,
 }
 
 #[derive(Clone)]
@@ -1014,6 +1064,9 @@ impl Owner {
         let (budget, floor) = Self::budget_floor();
         self.measure_with_limits(budget, floor)
     }
+    fn measure_with_limits(&self, budget_bytes: u64, floor: u64) -> Result<Status, String> {
+        self.measure_with_limits_bounded(budget_bytes, floor, ESCALATION_MARGIN)
+    }
     fn reader_authority(&self,record:&Resource)->Result<legacy::ReaderAuthority,String> {
         match &record.location {
             // These paths were granted only to fenced executions, or to the
@@ -1080,7 +1133,29 @@ impl Owner {
     pub(super) fn disk_floor_bytes() -> u64 {
         std::env::var("BRIDGE_WORKSPACE_MIN_FREE_GIB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(5).saturating_mul(GIB)
     }
-    fn measure_with_limits(&self, budget_bytes: u64, floor: u64) -> Result<Status, String> {
+    /// BR#6992 — the BUDGET half of the loud resource fence: the last
+    /// admission proof's hold, advertised when the budget leg (not the floor
+    /// leg, which `disk_headroom_hold` measures first-hand) is what fences
+    /// dispatch. This is what turns a budget-parked gateway from a silent
+    /// `eligible_work_not_reserved` starve into a named `resource_held`
+    /// host on the board. Read-only, no allocation, no ladder step: the
+    /// proof file is authoritative and fails open (None) when absent, stale
+    /// or unreadable — local admission stays the gate either way.
+    pub fn budget_hold_reason(cfg: &DispatchConfig) -> Option<String> {
+        let ledger = gateway_pipeline::root(cfg).ok()?.join("workspaces");
+        let status: Status = serde_json::from_slice(&fs::read(ledger.join("status.json")).ok()?).ok()?;
+        let (budget, floor) = Self::budget_floor();
+        let admissible = status.admissible_bytes?;
+        let fresh = now_ms().saturating_sub(status.observed_at) < 120_000;
+        (matches!(status.admission, Admission::Held { .. }) && fresh && admissible >= budget && status.available_bytes >= floor)
+            .then(|| format!("workspace disk budget: {} admissible bytes at/above the {}-byte budget ({} preserved outside it); {} bytes free; reclamation continues",
+                admissible, budget, status.preserved_bytes, status.available_bytes))
+    }
+    /// The real measurement body. Tests drive the escalation margin
+    /// explicitly (0 grants, u64::MAX blocks) so the proof is deterministic
+    /// on any host's real free space; production always resolves the
+    /// `ESCALATION_MARGIN` const via the `measure_with_limits` wrapper.
+    fn measure_with_limits_bounded(&self, budget_bytes: u64, floor: u64, margin: u64) -> Result<Status, String> {
         let records = self.records()?;
         let mut measured = HashMap::new();
         let mut positions = Vec::new();
@@ -1146,8 +1221,45 @@ impl Owner {
         // admission, so holding on their account is a pure deadlock, never a
         // control. The disk floor stays the hard safety.
         let admissible_bytes = managed_bytes.saturating_sub(preserved_bytes).saturating_add(cache_bytes).saturating_add(evidence_bytes);
-        let admission = if admissible_bytes >= budget_bytes || available_bytes < floor {
-            Admission::Held { reason: format!("workspace disk budget: {} bytes owned ({} preserved in errored/retained resources, {} admissible), {} cache, {} retained evidence, {} budget, {} available; reclamation continues", managed_bytes, preserved_bytes, managed_bytes.saturating_sub(preserved_bytes), cache_bytes, evidence_bytes, budget_bytes, available_bytes) }
+        // BR#6992 — the absorbing-deadlock detector. The 2026-11-27 starve:
+        // admissible 216 GiB over a 200 GiB budget whose admissible bytes are
+        // open-task worktrees; BR#22672's task-liveness grace refreshes their
+        // affinity clock forever, preserved bytes are already excluded from
+        // admissible, and dispatch — the only writer that closes tasks and
+        // releases those trees — is fenced by this very hold. Over-budget is
+        // therefore ABSORBING unless something grows the exit. A full pass
+        // whose counters are byte-identical to the previous pass's while the
+        // budget leg held is one pass of proof that nothing is moving.
+        let previous = self.status().ok();
+        let pending = records.iter().filter(|r| !matches!(r.phase, Phase::InUse { .. } | Phase::Removed { .. } | Phase::Cached { .. })).count();
+        let retained = records.iter().filter(|r| r.error.is_some()).count();
+        let stalled = previous.as_ref().is_some_and(|p|
+            p.admissible_bytes.is_some_and(|a| a >= budget_bytes)
+            && p.admissible_bytes == Some(admissible_bytes)
+            && p.preserved_bytes == preserved_bytes
+            && p.managed_bytes == managed_bytes
+            && p.pending == pending && p.retained == retained);
+        let stall_passes = match (&previous, stalled) { (Some(p), true) => p.stall_passes.saturating_add(1), _ => 0 };
+        // BR#6992 — the self-reverting budget escalation (see BudgetEscalation):
+        // carry a still-valid one, drop it when the config changed or the
+        // overage it relieved has cleared, grant/bump one only on proven stall
+        // with real headroom — the floor is never relaxed, the margin stays
+        // free, and every grant is loud (status + gateway alarm + hub-visible
+        // resource fence while the budget leg holds).
+        let mut escalation = previous.as_ref().and_then(|p| p.escalation.clone())
+            .filter(|e| e.from_bytes == budget_bytes && e.to_bytes > budget_bytes);
+        if escalation.is_some() && admissible_bytes < budget_bytes { escalation = None; }
+        if admissible_bytes >= budget_bytes && stall_passes >= STALL_PASSES
+            && available_bytes >= floor.saturating_add(margin) {
+            let to_bytes = admissible_bytes.saturating_add(ESCALATION_SLACK);
+            if escalation.as_ref().is_none_or(|e| e.to_bytes < to_bytes) {
+                escalation = Some(BudgetEscalation { from_bytes: budget_bytes, to_bytes, at: now_ms(), passes: stall_passes });
+            }
+        }
+        let effective_budget = escalation.as_ref().map(|e| e.to_bytes).unwrap_or(budget_bytes);
+        let admission = if admissible_bytes >= effective_budget || available_bytes < floor {
+            let note = escalation.as_ref().map(|e| format!(", budget escalated to {} (BR#6992 absorbing-deadlock relief, reverts below {})", e.to_bytes, e.from_bytes)).unwrap_or_default();
+            Admission::Held { reason: format!("workspace disk budget: {} bytes owned ({} preserved in errored/retained resources, {} admissible), {} cache, {} retained evidence, {} budget{}, {} available; reclamation continues", managed_bytes, preserved_bytes, managed_bytes.saturating_sub(preserved_bytes), cache_bytes, evidence_bytes, effective_budget, note, available_bytes) }
         } else { Admission::Ready };
         // BR#14716 — the silent wedge: `retained == resources` (EVERY record
         // errored) with a held admission means the reclaim ladder cannot
@@ -1158,19 +1270,23 @@ impl Owner {
         // log — no per-record error ever surfaced, no alarm fired, the board
         // read "idle". Surface the head of the actual per-record errors on
         // the status (so `workspaces status` names WHY, first-hand) and
-        // persist the wedge verdict alongside them.
+        // persist the wedge verdict alongside them. BR#6992 generalizes the
+        // verdict from "all records errored" to "zero reclaim progress":
+        // the 2026-11-27 starve wedged at 559/2478 errored — the all-errored
+        // shape never fired while admissible, pending and retained stayed
+        // byte-identical for hours.
         let errors: Vec<(String, String)> = records.iter().filter(|r| r.error.is_some())
             .map(|r| (r.id.clone(), r.error.clone().unwrap_or_default())).collect();
         let wedge = matches!(admission, Admission::Held { .. })
-            && !errors.is_empty() && errors.len() == records.len();
+            && ((!errors.is_empty() && errors.len() == records.len())
+                || stall_passes >= STALL_PASSES);
         let status = Status { observed_at: now_ms(), last_reconciled_at: now_ms(), managed_bytes, cache_bytes, evidence_bytes,
             reclaimed_bytes,
-            resources: records.len(), pending: records.iter().filter(|r| !matches!(r.phase, Phase::InUse { .. } | Phase::Removed { .. } | Phase::Cached { .. })).count(),
-            retained: records.iter().filter(|r| r.error.is_some()).count(), budget_bytes, available_bytes, admission,
+            resources: records.len(), pending, retained, budget_bytes, available_bytes, admission,
             wedge: wedge.then_some(()),
             error_head: errors.into_iter().take(10).collect(),
             admissible_bytes: Some(admissible_bytes),
-            preserved_bytes };
+            preserved_bytes, stall_passes, escalation };
         self.write_status(&status)?;
         // BR#22634 — refill the journal recovery reserves while the volume
         // is healthy (comfortably above the floor): a drained reserve is
@@ -1217,8 +1333,19 @@ impl Owner {
             return Err("workspace inventory has not yet been measured; admission sampling unavailable".into());
         };
         status.available_bytes = available_bytes(&self.allocations)?;
-        status.admission = if admissible_bytes >= budget_bytes || status.available_bytes < floor {
-            Admission::Held { reason: format!("workspace disk budget: {} bytes owned ({} preserved in errored/retained resources, {} admissible), {} cache, {} retained evidence, {} budget, {} available; reclamation continues", status.managed_bytes, status.preserved_bytes, admissible_bytes.saturating_sub(status.cache_bytes).saturating_sub(status.evidence_bytes), status.cache_bytes, status.evidence_bytes, budget_bytes, status.available_bytes) }
+        // BR#6992 — the sampler never GRANTS an escalation: it has no fresh
+        // inventory and does no stall counting — the full pass is the sole
+        // grant authority. It only HONOURS a still-valid one (same configured
+        // budget) so the sampler and the full pass can never disagree about
+        // what "held" means while an escalation is active. The floor leg is
+        // re-evaluated first-hand from statvfs either way.
+        let escalation = status.escalation.clone()
+            .filter(|e| e.from_bytes == budget_bytes && e.to_bytes > budget_bytes);
+        let effective_budget = escalation.as_ref().map(|e| e.to_bytes).unwrap_or(budget_bytes);
+        status.escalation = escalation;
+        status.admission = if admissible_bytes >= effective_budget || status.available_bytes < floor {
+            let note = status.escalation.as_ref().map(|e| format!(", budget escalated to {} (BR#6992 absorbing-deadlock relief, reverts below {})", e.to_bytes, e.from_bytes)).unwrap_or_default();
+            Admission::Held { reason: format!("workspace disk budget: {} bytes owned ({} preserved in errored/retained resources, {} admissible), {} cache, {} retained evidence, {} budget{}, {} available; reclamation continues", status.managed_bytes, status.preserved_bytes, admissible_bytes.saturating_sub(status.cache_bytes).saturating_sub(status.evidence_bytes), status.cache_bytes, status.evidence_bytes, effective_budget, note, status.available_bytes) }
         } else { Admission::Ready };
         // The record counters are re-derived cheaply from the journalled
         // records; byte totals stay as last fully measured.
@@ -1228,8 +1355,11 @@ impl Owner {
         status.resources = records.len();
         status.pending = records.iter().filter(|r| !matches!(r.phase, Phase::InUse { .. } | Phase::Removed { .. } | Phase::Cached { .. })).count();
         status.retained = errors.len();
+        // BR#6992 — the zero-progress wedge verdict generalizes here too
+        // (stall passes are carried from the full pass; the sampler never
+        // advances the ladder, so it never counts stalls).
         status.wedge = (matches!(status.admission, Admission::Held { .. })
-            && !errors.is_empty() && errors.len() == records.len()).then_some(());
+            && ((!errors.is_empty() && errors.len() == records.len()) || status.stall_passes >= STALL_PASSES)).then_some(());
         status.error_head = errors.into_iter().take(10).collect();
         status.observed_at = now_ms();
         self.write_status(&status)?;

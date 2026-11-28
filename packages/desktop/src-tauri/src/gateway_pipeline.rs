@@ -967,6 +967,13 @@ pub(super) struct Controller { registry: Registry, admission: Admission, shared:
     disk_admission: workspace::Admission, disk_observed: Instant,
     /// BR#14716 — throttle stamp for the wedge class alarm (see the workspace tick).
     last_wedge_alarm_at: Option<u64>,
+    /// BR#6992 — the last (from,to) escalation pair seen on the workspace
+    /// status, so a grant or bump is alarmed exactly once per change.
+    last_escalation_seen: Option<(u64, u64)>,
+    /// BR#6992 — when the dispatch park (disk admission not ready) began
+    /// (epoch ms), persisted to the dispatch-health receipt the update
+    /// supervisor consumes (root-fix #6). `None` while dispatch is not parked.
+    starved_since: Option<u64>,
     reported_attention:std::collections::HashSet<(String,String)> }
 impl Controller {
     #[cfg(test)]
@@ -991,7 +998,7 @@ impl Controller {
             Ok(None) => Admission::Idle { until: Instant::now() },
             Err(reason) => Admission::Held { reason },
         };
-        Self { registry, admission, shared, recovery: Recovery::Initial, last_snapshot: Instant::now(), capacity_probe: None, next_capacity_probe: Instant::now(), workspace_job: None, next_workspace: Instant::now(), workspace_forced: false, admission_job: None, next_admission: Instant::now(), disk_admission: workspace::Admission::Held { reason: "workspace inventory not yet reconciled".into() }, disk_observed:Instant::now(), last_wedge_alarm_at: None, reported_attention:Default::default() }
+        Self { registry, admission, shared, recovery: Recovery::Initial, last_snapshot: Instant::now(), capacity_probe: None, next_capacity_probe: Instant::now(), workspace_job: None, next_workspace: Instant::now(), workspace_forced: false, admission_job: None, next_admission: Instant::now(), disk_admission: workspace::Admission::Held { reason: "workspace inventory not yet reconciled".into() }, disk_observed:Instant::now(), last_wedge_alarm_at: None, last_escalation_seen: None, starved_since: None, reported_attention:Default::default() }
     }
     pub fn idle(&self) -> bool { self.registry.is_idle() && self.capacity_probe.is_none() && self.workspace_job.is_none() && self.admission_job.is_none() && matches!(self.admission, Admission::Idle { .. }) && matches!(self.recovery, Recovery::Ready { .. }) }
     pub fn active(&self) -> usize { usize::from(!self.idle()) }
@@ -1080,6 +1087,22 @@ impl Controller {
                                     "ALARM workspace reclaim WEDGED: admission held AND all {} resources errored — zero reclaim progress possible; dispatch fully fenced. First errors: {head}",
                                     status.resources));
                             }
+                        }
+                        // BR#6992 — the escalation grant/bump alarm: the
+                        // configured budget was bypassed (bounded, provably
+                        // stalled, floor-gated, self-reverting) — that must
+                        // never happen silently. One ALARM line per grant or
+                        // bump, naming both bounds.
+                        if let Some(e) = &status.escalation {
+                            let pair = (e.from_bytes, e.to_bytes);
+                            if self.last_escalation_seen != Some(pair) {
+                                self.last_escalation_seen = Some(pair);
+                                dlog("workspace", &format!(
+                                    "ALARM workspace budget ESCALATED: {} -> {} bytes after {} stalled full passes (BR#6992 absorbing-deadlock relief; self-reverts below {} while {} bytes stay free; dispatch resumes on the escalated budget)",
+                                    e.from_bytes, e.to_bytes, e.passes, e.from_bytes, status.available_bytes));
+                            }
+                        } else if self.last_escalation_seen.is_some() {
+                            self.last_escalation_seen = None;
                         }
                         if let Ok(mut snapshot) = snap.lock() { snapshot.workspaces = Some(status); }
                     },
@@ -1187,15 +1210,47 @@ impl Controller {
             let counts = self.registry.counts();
             let mut flights = Vec::new();
             self.registry.visit_running(|_, r, _| flights.push(InFlightView { task_id: r.task_id.clone(), task_title: r.task_title.clone(), started_ms: now_ms().saturating_sub(r.started.elapsed().as_millis() as u64), last_note: r.live_line() }));
+            let in_flight = flights.len();
             if let Ok(mut snapshot) = snap.lock() { snapshot.in_flight = flights; snapshot.lifecycle = Some(counts); }
             let mut attention=std::collections::HashSet::new();
             for (ticket, reason) in self.registry.held() { attention.insert((ticket.task_id.clone(),format!("lifecycle held with durable ownership: {reason}"))); }
             if let Admission::Held { reason } = &self.admission { attention.insert(("gateway".into(),reason.clone())); }
             if let Recovery::Held { reason } = &self.recovery { attention.insert(("gateway".into(),reason.clone())); }
+            // BR#6992 — the dispatch park must speak. `disk_ready` false (a
+            // Held disk admission, or its proof aged past the 120s window)
+            // parks dispatch at the Idle→Request transition with no other
+            // trace: the 2026-11-27 starve sat here for 5+ hours with the
+            // board reading a generic eligible_work_not_reserved episode.
+            // The attention set is the deduped log surface; the hub-visible
+            // half rides the advertised inventory (resource_hold) and the
+            // supervisor half rides the dispatch-health receipt below.
+            let parked_reason = if !disk_ready {
+                match &self.disk_admission {
+                    workspace::Admission::Held { reason } => Some(format!("dispatch parked on workspace disk: {reason}")),
+                    workspace::Admission::Ready => Some("dispatch parked: workspace disk admission proof is stale".into()),
+                }
+            } else { None };
+            if let Some(reason) = &parked_reason { attention.insert(("gateway".into(), reason.clone())); }
             // Display deduplication only; this set never supplies eligibility,
             // process proof or a recovery decision.
             for (scope,reason) in attention.difference(&self.reported_attention) {dlog(scope,reason);}
             self.reported_attention=attention;
+            // BR#6992 root-fix #6 (leg 1) — the dispatch-health receipt: the
+            // runner's first-hand starve evidence for the update supervisor
+            // (the sole owner of stop/start), so a persistent parked starve
+            // becomes a disposition instead of an unactioned alarm. The
+            // starve clock is per-process: a restart clears it, and the
+            // supervisor's cooldown bounds what that implies.
+            if parked_reason.is_some() { self.starved_since.get_or_insert_with(now_ms); } else { self.starved_since = None; }
+            crate::dispatch::update_receipt("dispatch-health.json", &serde_json::json!({
+                "pid": std::process::id(),
+                "commit": option_env!("BRIDGE_BUILD_COMMIT").unwrap_or("unknown"),
+                "observed_at": now_ms(),
+                "parked": parked_reason.is_some(),
+                "parked_reason": parked_reason,
+                "in_flight": in_flight,
+                "starved_since": self.starved_since,
+            }));
             self.last_snapshot = Instant::now();
         }
         Ok(())
