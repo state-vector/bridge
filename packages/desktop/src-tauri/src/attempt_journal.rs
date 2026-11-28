@@ -180,6 +180,12 @@ pub fn ensure_reserve(root: &Path) { ensure_reserve_sized(root, reserve_bytes())
 pub(crate) fn ensure_reserve_sized(root: &Path, want: u64) {
     let path = root.join(RESERVE_NAME);
     if want == 0 { return }
+    // BR#6992 follow-up: a missing parent makes the fill a silent no-op —
+    // the reserve then never refills even while the volume is healthy
+    // (observed: a cold lifecycle root zeroed the suite's evidence du and
+    // an ops-swept root would quietly drop the BR#22634 survival reserve).
+    // The fill is best-effort by contract; creating the dir is too.
+    let _ = fs::create_dir_all(root);
     if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) >= want { return }
     let tmp = path.with_extension(format!("reserve-{}.tmp", std::process::id()));
     let Ok(mut file) = fs::File::create(&tmp) else { return };

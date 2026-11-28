@@ -224,10 +224,12 @@ pub struct Status {
     /// cached for the sampler's Held reason.
     #[serde(default)]
     pub preserved_bytes: u64,
-    /// BR#6992 — consecutive FULL reconcile passes whose inventory counters
-    /// (admissible, preserved, pending, retained, managed) were byte-identical
-    /// while the budget leg held admission: zero reclaim progress. Reaching
-    /// `STALL_PASSES` is the absorbing-deadlock proof behind `escalation`.
+    /// BR#6992 — consecutive FULL reconcile passes in which the budget leg
+    /// held and the admissible total did not fall: nothing that can repay
+    /// the budget-leg hold is happening (preserved/retained churn does not
+    /// count — reclaiming preserved bytes can never open the budget gate).
+    /// Reaching `STALL_PASSES` is the absorbing-deadlock proof behind
+    /// `escalation`.
     #[serde(default)]
     pub stall_passes: u32,
     /// BR#6992 — the active budget escalation (see `BudgetEscalation`).
@@ -1227,18 +1229,26 @@ impl Owner {
         // affinity clock forever, preserved bytes are already excluded from
         // admissible, and dispatch — the only writer that closes tasks and
         // releases those trees — is fenced by this very hold. Over-budget is
-        // therefore ABSORBING unless something grows the exit. A full pass
-        // whose counters are byte-identical to the previous pass's while the
-        // budget leg held is one pass of proof that nothing is moving.
+        // therefore ABSORBING unless something grows the exit. The proof is
+        // on the BUDGET-LEG ledger: the gate repays only when the admissible
+        // total FALLS (a pending worktree reclaimed). Preserved/retained
+        // churn — liveness resolution reclassifying preserved bytes into
+        // admissible, errored-record removal taking preserved bytes out —
+        // moves managed/preserved/retained/pending but cannot open the
+        // budget gate by construction. The live 2026-11-28 host showed
+        // exactly that shape: retained 532→518 over 40 minutes of churn
+        // with admissible byte-identical and dispatch parked throughout,
+        // which would have reset a whole-inventory freeze forever. One full
+        // pass in which the budget leg held and the admissible total did
+        // not fall is therefore one pass of proof that the gate is not
+        // being repaid.
         let previous = self.status().ok();
         let pending = records.iter().filter(|r| !matches!(r.phase, Phase::InUse { .. } | Phase::Removed { .. } | Phase::Cached { .. })).count();
         let retained = records.iter().filter(|r| r.error.is_some()).count();
         let stalled = previous.as_ref().is_some_and(|p|
             p.admissible_bytes.is_some_and(|a| a >= budget_bytes)
-            && p.admissible_bytes == Some(admissible_bytes)
-            && p.preserved_bytes == preserved_bytes
-            && p.managed_bytes == managed_bytes
-            && p.pending == pending && p.retained == retained);
+            && admissible_bytes >= budget_bytes
+            && p.admissible_bytes.is_some_and(|a| a <= admissible_bytes));
         let stall_passes = match (&previous, stalled) { (Some(p), true) => p.stall_passes.saturating_add(1), _ => 0 };
         // BR#6992 — the self-reverting budget escalation (see BudgetEscalation):
         // carry a still-valid one, drop it when the config changed or the

@@ -1,24 +1,42 @@
 use super::*;
 use super::super::gateway_pipeline::tests::{Hub, fixture};
 
-struct Sandbox(PathBuf);
+struct Sandbox(PathBuf, String);
 impl Sandbox {
+    fn cfg(&self) -> DispatchConfig {
+        serde_json::from_value(json!({"url":"http://127.0.0.1:1","label":self.1,"workdir":self.0.join("disk")})).unwrap()
+    }
     fn new() -> Self {
         static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!("bridge-owner-test-{}-{}-{}", std::process::id(), now_ms(), SEQUENCE.fetch_add(1, Ordering::Relaxed)));
-        fs::create_dir_all(&root).unwrap(); Self(root)
+        let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("bridge-owner-test-{}-{}-{}", std::process::id(), now_ms(), seq));
+        fs::create_dir_all(&root).unwrap();
+        // BR#6992 follow-up: a UNIQUE gateway label per sandbox gives every
+        // test its OWN lifecycle root under $HOME/.bridge/lifecycle/. The
+        // suite previously shared one root (fixed url + label), so every
+        // measure's evidence du counted OTHER tests' concurrent writes —
+        // byte-exact assertions across passes were an order-lottery (the
+        // 2026-11-28 CI run lost it: an 8 KiB seed written by a sibling
+        // test landed inside a climb window and shifted the grant). The
+        // label keys the root (stable_key(url, label)) and Drop removes it.
+        Self(root, format!("workspace-tests-{seq}"))
     }
     fn owner(&self) -> Owner {
         // 127.0.0.1:1 refuses instantly — the liveness query must fail FAST
         // in tests that exercise the hub-unreachable path (and never stall
         // on DNS for .invalid-style hostnames).
-        let cfg: DispatchConfig = serde_json::from_value(json!({"url":"http://127.0.0.1:1","label":"workspace-tests","workdir":self.0.join("disk")})).unwrap();
+        let cfg = self.cfg();
         let ledger = self.0.join("journal"); let allocations = self.0.join("disk/workspaces");
         fs::create_dir_all(&ledger).unwrap(); fs::create_dir_all(&allocations).unwrap();
         Owner { cfg, ledger, allocations: allocations.canonicalize().unwrap() }
     }
 }
-impl Drop for Sandbox { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+        if let Ok(lifecycle) = super::super::gateway_pipeline::root(&self.cfg()) { let _ = fs::remove_dir_all(lifecycle); }
+    }
+}
 fn ticket(id: &str) -> Ticket { Ticket { task_id: id.into(), session: format!("session-{id}") } }
 fn attempt(ticket: &Ticket) -> Ownership { Ownership::Attempt { ticket: ticket.clone(), host:"host".into(), generation:1, attempt_id:format!("attempt-{}",ticket.session) } }
 fn released(owner: &Ownership) -> lifecycle::Released {
@@ -215,6 +233,13 @@ fn budget_counts_aliased_nested_allocations_once() {
 #[test]
 fn scratch_inputs_outside_nested_repositories_are_retained_and_budget_blocks_growth() {
     let sandbox=Sandbox::new();let owner=sandbox.owner();ready(&owner);
+    // The premise below (the budget leg blocks growth) needs admissible >= 1;
+    // this record's bytes are all PRESERVED (retained scratch source), so
+    // admissible is the evidence du of this sandbox's PRIVATE lifecycle root
+    // — filled deterministically by ready()'s reserve refill (BR#6992
+    // follow-up made that refill create its own root; before that, a cold
+    // $HOME measured du-of-missing-dir 0 and this passed only when sibling
+    // tests happened to warm the shared root first).
     let t=ticket("scratch");let a=owner.allocate(&t,None).unwrap();fs::write(a.work.join("unpublished-plan"),"keep").unwrap();
     let id=a.id.clone();let root=a.root.clone();drop(a);owner.release(&released(&Ownership::Reservation {ticket:t})).unwrap();
     owner.reconcile(&[]).unwrap();assert_source_not_removed(&owner,&id,&root);assert_eq!(fs::read_to_string(root.join("work/unpublished-plan")).unwrap(),"keep");assert!(owner.read(&id).unwrap().error.unwrap().contains("non-Git"));
@@ -992,17 +1017,28 @@ fn absorbing_budget_stall_escalates_bounded_and_reverts_when_the_overage_clears(
     fs::write(a.work.join("wip"),vec![0u8;64*1024]).unwrap();
     let budget=1u64;
     let measure=|owner:&Owner| owner.measure_with_limits_bounded(budget,0,0).unwrap();
+    // The settling pass: the byte state is in place. The clock's START is
+    // host-dependent and deliberately unasserted: on a warm HOME the
+    // ready() status already carries the shared gateway lifecycle root's
+    // evidence bytes, so the baseline is a RISE (a rise is not repayment —
+    // it counts, clock 1); on a fresh HOME that root does not exist yet,
+    // ready()'s admissible is 0 (du of a missing dir is 0) and the
+    // baseline legitimately starts the clock at 0. The contract under
+    // proof is the climb: every FROZEN pass after the settling one climbs
+    // by exactly one, and the grant lands at exactly STALL_PASSES.
     let baseline=measure(&owner);
     assert!(matches!(baseline.admission,Admission::Held {..}));
-    assert_eq!(baseline.stall_passes,0);
-    for i in 1..STALL_PASSES {
+    let mut prev=baseline.stall_passes;
+    let mut granted=None;
+    for _ in 0..(STALL_PASSES+2) {
         let status=measure(&owner);
-        assert_eq!(status.stall_passes,i,"pass {i}: the stall counts frozen full passes");
+        if status.escalation.is_some() { granted=Some(status); break; }
+        assert_eq!(status.stall_passes,prev+1,"a frozen pass climbs the proof by exactly one");
         assert!(matches!(status.admission,Admission::Held {..}));
-        assert!(status.escalation.is_none(),"pass {i}: no escalation before the proof bar");
-        assert!(status.wedge.is_none(),"pass {i}: not wedged before the proof bar");
+        assert!(status.wedge.is_none(),"not wedged before the proof bar");
+        prev=status.stall_passes;
     }
-    let grant=measure(&owner);
+    let grant=granted.expect("a proven absorbing stall escalates the budget");
     assert_eq!(grant.stall_passes,STALL_PASSES);
     let escalation=grant.escalation.as_ref().expect("a proven absorbing stall escalates the budget");
     assert_eq!(escalation.from_bytes,budget);
@@ -1016,14 +1052,9 @@ fn absorbing_budget_stall_escalates_bounded_and_reverts_when_the_overage_clears(
     assert!(matches!(owner.refresh_admission_with(budget,u64::MAX).unwrap().admission,Admission::Held {..}),"the disk floor stays the hard safety even while escalated");
     // A later full pass carries the escalation while the overage persists.
     assert_eq!(measure(&owner).escalation,grant.escalation);
-    // A config change retires the escalation rather than carrying it across.
+    // A config change retires the escalation rather than carrying it across
+    // (the overage-clearing self-revert is proven in its own test below).
     assert!(owner.refresh_admission_with(2,0).unwrap().escalation.is_none());
-    // The overage clears: the escalation self-reverts and the stall resets.
-    fs::write(a.work.join("wip"),vec![0u8;1024]).unwrap();
-    let reverted=measure(&owner);
-    assert!(reverted.escalation.is_none(),"the escalation self-reverts once admissible drops below the configured budget");
-    assert!(matches!(reverted.admission,Admission::Held {..}),"a fresh overage starts from a clean proof");
-    assert_eq!(reverted.stall_passes,0,"movement — any movement — resets the stall");
 }
 
 #[test]
@@ -1032,41 +1063,139 @@ fn proven_stall_without_margin_headroom_wedges_loudly_instead_of_escalating() {
     let t=ticket("tight");let a=owner.allocate(&t,None).unwrap();
     fs::write(a.work.join("wip"),vec![0u8;64*1024]).unwrap();
     // An unreachable escalation margin: the floor never trips, the budget leg
-    // holds, and the zero-progress stall must surface as a WEDGE (the
+    // holds, and the zero-repayment stall must surface as a WEDGE (the
     // generalized BR#14716 verdict) instead of a grant.
-    for i in 0..=STALL_PASSES {
+    let mut wedged=false;
+    for _ in 0..(STALL_PASSES+4) {
         let status=owner.measure_with_limits_bounded(1,0,u64::MAX).unwrap();
         assert!(matches!(status.admission,Admission::Held {..}));
         assert!(status.escalation.is_none(),"no escalation without margin headroom");
-        if i<STALL_PASSES { assert!(status.wedge.is_none(),"pass {i}: not wedged before the proof bar"); }
-        else { assert!(status.wedge.is_some(),"the zero-progress stall is a wedge verdict, not idle"); }
+        if status.wedge.is_some() { wedged=true; break; }
     }
+    assert!(wedged,"the zero-repayment stall is a wedge verdict, not idle");
 }
 
 #[test]
-fn the_stall_proof_requires_identical_counters_and_a_budget_leg_hold() {
+fn the_stall_proof_is_repaid_only_by_admissible_bytes_falling() {
     let sandbox=Sandbox::new();let owner=sandbox.owner();ready(&owner);
-    let t=ticket("moving");let a=owner.allocate(&t,None).unwrap();
-    fs::write(a.work.join("wip"),vec![0u8;64*1024]).unwrap();
-    // Movement (bytes growing between passes) resets the stall: a healthy
-    // dispatch burst must never look like an absorbing deadlock. (8 KiB
-    // steps: smaller deltas vanish inside filesystem block granularity.)
+    let t=ticket("draining");let a=owner.allocate(&t,None).unwrap();
+    fs::write(a.work.join("wip"),vec![0u8;128*1024]).unwrap();
+    // Settle the byte state (the rise pass may start the clock — irrelevant
+    // here), then prove: real repayment — the admissible total FALLING, a
+    // pending worktree actually reclaimed — resets the proof clock: a
+    // draining ladder is progress, never an absorbing deadlock. Growth and
+    // reclassification do not reset it (not repayment — proven in the churn
+    // test). (8 KiB steps: smaller deltas vanish inside filesystem block
+    // granularity.)
+    let _settled=owner.measure_with_limits_bounded(1,0,0).unwrap();
+    let mut size=120*1024usize;
     for i in 0..(STALL_PASSES*2) {
-        fs::write(a.work.join("wip"),vec![0u8;(64+i as usize*8)*1024]).unwrap();
+        fs::write(a.work.join("wip"),vec![0u8;size]).unwrap();
         let status=owner.measure_with_limits_bounded(1,0,0).unwrap();
-        assert_eq!(status.stall_passes,0,"counter movement resets the stall");
+        assert_eq!(status.stall_passes,0,"pass {i}: falling admissible repays the hold and resets the stall");
         assert!(status.escalation.is_none());
+        size=size.saturating_sub(8*1024).max(1024);
     }
     // An overage under a floor hold is a real disk problem, not a budget
-    // deadlock: the passes still count as zero progress (the wedge verdict
+    // deadlock: the passes still count as zero repayment (the wedge verdict
     // applies to a full volume too), but no escalation can ever grant out
     // of it — the margin gate cannot be satisfied below the floor.
-    for i in 0..=(STALL_PASSES+1) {
+    let mut wedged=false;
+    for _ in 0..(STALL_PASSES+4) {
         let status=owner.measure_with_limits_bounded(1,u64::MAX,0).unwrap();
         assert!(matches!(status.admission,Admission::Held {..}));
         assert!(status.escalation.is_none(),"no escalation can grant below the floor");
-        if i>=STALL_PASSES { assert!(status.wedge.is_some(),"a full-volume zero-progress stall is a wedge verdict"); }
+        if status.wedge.is_some() { wedged=true; break; }
     }
+    assert!(wedged,"a full-volume zero-repayment stall is a wedge verdict");
+}
+
+#[test]
+fn preserved_churn_never_resets_the_budget_stall_proof() {
+    let sandbox=Sandbox::new();let owner=sandbox.owner();ready(&owner);
+    // BR#6992 live shape, 2026-11-28 host: an open-task worktree (admissible)
+    // beside a liveness-errored record (preserved). The healed hub let the
+    // ladder keep resolving errored records — preserved bytes reclassified
+    // into admissible (retained 532→523, +2.4 GiB) and resolved records left
+    // the ledger (retained 523→518) — while the admissible total never fell
+    // and dispatch stayed fenced. That churn is NOT repayment: reclaiming
+    // preserved bytes can never open the budget gate, so it must not reset
+    // the absorbing-deadlock proof.
+    let t=ticket("open-task");let a=owner.allocate(&t,None).unwrap();
+    fs::write(a.work.join("wip"),vec![0u8;64*1024]).unwrap();
+    let e=ticket("liveness-errored");let b=owner.allocate(&e,None).unwrap();
+    fs::write(b.work.join("wip"),vec![0u8;32*1024]).unwrap();
+    let bid=b.id.clone();
+    let errored=|owner:&Owner,error:Option<&str>| {
+        let mut record=owner.read(&bid).unwrap();
+        record.error=error.map(|message| message.into());
+        owner.save(&record).unwrap();
+    };
+    errored(&owner,Some("task liveness unavailable; worktree retained"));
+    let measure=|owner:&Owner| owner.measure_with_limits_bounded(1,0,0).unwrap();
+    // Climb the proof clock under the frozen admissible total.
+    let mut held=measure(&owner);
+    while held.stall_passes<3 { held=measure(&owner); }
+    let admissible_before=held.admissible_bytes.unwrap();
+    // Churn event 1 — reclassification: the liveness verdict arrives, the
+    // error clears, the record's bytes move preserved -> admissible.
+    errored(&owner,None);
+    let reclassified=measure(&owner);
+    assert!(reclassified.admissible_bytes.unwrap()>admissible_before,"the reclassification raises the admissible total");
+    assert_eq!(reclassified.stall_passes,held.stall_passes+1,"preserved->admissible churn is not repayment: the proof climbs through it");
+    // Relabeling back to preserved LOWERS admissible: conservative reset —
+    // the gate might genuinely be repaid by the relabel.
+    errored(&owner,Some("task liveness unavailable; worktree retained"));
+    let re_errored=measure(&owner);
+    assert!(re_errored.admissible_bytes.unwrap()<reclassified.admissible_bytes.unwrap(),"relabeling to preserved lowers the admissible total");
+    assert_eq!(re_errored.stall_passes,0,"a falling admissible total resets the proof");
+    // Churn event 2 — removal: the record resolves and leaves the ledger,
+    // its preserved bytes going with it — the 03:51Z live shape: pending,
+    // retained, managed and preserved all move while admissible is
+    // byte-identical.
+    let mut pre=measure(&owner);
+    while pre.stall_passes<2 { pre=measure(&owner); }
+    fs::remove_file(owner.ledger.join(format!("{bid}.json"))).unwrap();
+    let removed=measure(&owner);
+    assert_eq!(removed.admissible_bytes,pre.admissible_bytes,"record removal leaves the admissible total untouched");
+    assert_eq!(removed.stall_passes,pre.stall_passes+1,"record-removal churn is not repayment: the proof climbs");
+    // The proof completes THROUGH the churn and escalates.
+    let mut granted=None;
+    for _ in 0..=(STALL_PASSES+2) {
+        if let Some(escalation)=measure(&owner).escalation { granted=Some(escalation); break; }
+    }
+    let grant=granted.expect("the absorbing proof completes through preserved churn and escalates");
+    assert_eq!(grant.to_bytes,removed.admissible_bytes.unwrap().saturating_add(ESCALATION_SLACK),"the grant is bounded to one slack above the stalled admissible total");
+}
+
+#[test]
+fn the_escalation_self_reverts_when_the_overage_clears_below_the_configured_budget() {
+    let sandbox=Sandbox::new();let owner=sandbox.owner();ready(&owner);
+    let t=ticket("relieved");let a=owner.allocate(&t,None).unwrap();
+    fs::write(a.work.join("wip"),vec![0u8;64*1024]).unwrap();
+    // A budget inside the overage: the shrunk state must land below it.
+    let probe=owner.measure_with_limits_bounded(u64::MAX,0,0).unwrap();
+    let budget=probe.admissible_bytes.unwrap().saturating_sub(32*1024);
+    let measure=|owner:&Owner| owner.measure_with_limits_bounded(budget,0,0).unwrap();
+    let mut grant=None;
+    for i in 1..=STALL_PASSES {
+        let status=measure(&owner);
+        assert_eq!(status.stall_passes,i,"pass {i} climbs (the preceding Ready probe pass resets the clock)");
+        if i==STALL_PASSES {
+            grant=status.escalation.clone();
+            assert!(grant.is_some(),"the proven stall escalates");
+            assert!(matches!(status.admission,Admission::Ready),"the grant re-opens dispatch under the overage");
+        }
+    }
+    assert!(grant.as_ref().is_some_and(|e| e.from_bytes==budget));
+    // The overage clears below the configured budget: the escalation
+    // self-reverts (distinct from the config-change retire path), the
+    // proof clock resets, and the gate opens outright.
+    fs::write(a.work.join("wip"),vec![0u8;1024]).unwrap();
+    let reverted=measure(&owner);
+    assert!(reverted.escalation.is_none(),"the escalation self-reverts once admissible drops below the configured budget");
+    assert!(matches!(reverted.admission,Admission::Ready),"the cleared overage opens the gate outright");
+    assert_eq!(reverted.stall_passes,0,"falling admissible resets the proof clock");
 }
 
 #[test]

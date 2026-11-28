@@ -36,7 +36,9 @@ An over-budget hold that cannot drain is an absorbing deadlock when the
 admissible bytes are open-task worktrees (BR#6992): the ladder's
 task-liveness grace holds them, and dispatch — the only thing that closes
 their tasks — is fenced by the same hold. The owner proves this from its own
-ledger (eight consecutive full passes with byte-identical counters) and
+ledger (eight consecutive full passes in which the budget leg held and the
+admissible total did not fall — repayment is only ever admissible bytes
+reclaimed, preserved-byte churn can never open the gate) and
 escalates the budget, self-reverting, by 8 GiB of slack above the stalled
 total — only while 32 GiB stay free beside the hard floor, alarmed on every
 grant, reverting below the configured budget or on any config change.
